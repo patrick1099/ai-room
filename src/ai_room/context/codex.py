@@ -15,6 +15,9 @@ from .base import ContextAdapter, unknown_sample
 class _ContradictoryIdentityError(ValueError):
     """One Codex record carries incompatible recognized session identities."""
 
+    def __init__(self, identities: set[str]) -> None:
+        self.identities = frozenset(identities)
+
 
 class CodexContextAdapter(ContextAdapter):
     """Discover and sample the transcript identified by ``CODEX_THREAD_ID``."""
@@ -53,12 +56,14 @@ class CodexContextAdapter(ContextAdapter):
                         transcript,
                         session_id,
                     )
-                except _ContradictoryIdentityError:
-                    return unknown_sample(
-                        session_id,
-                        "Codex format drift: contradictory identities in "
-                        f"transcript {transcript}",
-                    )
+                except _ContradictoryIdentityError as exc:
+                    if session_id in exc.identities:
+                        return unknown_sample(
+                            session_id,
+                            "Codex format drift: contradictory identities in "
+                            f"transcript {transcript}",
+                        )
+                    continue
                 if identified is None:
                     unreadable += 1
                 elif identified:
@@ -182,7 +187,7 @@ def _transcript_identifies_thread(
                 identities = _codex_record_identities(record)
                 if identities:
                     if len(identities) > 1:
-                        raise _ContradictoryIdentityError
+                        raise _ContradictoryIdentityError(identities)
                     return session_id in identities
     except (OSError, UnicodeError):
         return None

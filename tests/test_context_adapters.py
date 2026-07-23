@@ -155,6 +155,33 @@ def test_codex_discovery_rejects_contradictory_record_identities(
     assert "contradictory" in (sample.unknown_reason or "").lower()
 
 
+def test_codex_discovery_ignores_unrelated_contradictory_transcript(
+    tmp_path: Path,
+    fixture_dir: Path,
+) -> None:
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    for fixture in (
+        "codex_session_contradictory_unrelated.jsonl",
+        "codex_session.jsonl",
+    ):
+        (sessions / fixture).write_text(
+            (fixture_dir / fixture).read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+    adapter = CodexContextAdapter(
+        environ={
+            "CODEX_THREAD_ID": "thread-123",
+            "CODEX_HOME": str(tmp_path),
+        }
+    )
+
+    sample = adapter.sample()
+
+    assert sample.input_tokens == 156_000
+    assert sample.source is ContextSource.CODEX_TOKEN_COUNT
+
+
 def test_claude_uses_latest_assistant_event_even_when_it_drifted(
     tmp_path: Path,
 ) -> None:
