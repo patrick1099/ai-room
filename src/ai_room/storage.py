@@ -24,10 +24,11 @@ from .domain import (
     TaskState,
     TaskView,
 )
+from .context.policy import PreviousContextCheck
 from .workspace_guard import WorkspaceSnapshot
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _ACTIVE_STATES = (TaskState.WORKING.value, TaskState.WAITING_CHECKPOINT.value)
 _TERMINAL_STATES = {
     TaskOutcome.DONE: TaskState.DONE,
@@ -189,6 +190,17 @@ CREATE TABLE workspace_baselines (
     snapshot_json TEXT NOT NULL,
     created_at REAL NOT NULL,
     PRIMARY KEY (task_id, round_no)
+);
+
+CREATE TABLE context_check_state (
+    room_id TEXT NOT NULL REFERENCES rooms(room_id),
+    agent TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL,
+    checkpoint_fingerprint TEXT NOT NULL,
+    task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+    awaiting_reset INTEGER NOT NULL CHECK (awaiting_reset IN (0, 1)),
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (room_id, agent)
 );
 """
 
@@ -726,6 +738,162 @@ class SQLiteStore:
                 raise DatabaseBusyError("database remained busy for 5000 ms") from error
             raise
 
+    def get_previous_context_check(
+        self,
+        room_id: str,
+        agent: AgentName,
+    ) -> PreviousContextCheck | None:
+        row = self._connection.execute(
+            """
+            SELECT input_tokens, checkpoint_fingerprint, awaiting_reset
+            FROM context_check_state
+            WHERE room_id = ? AND agent = ?
+            """,
+            (room_id, agent.value),
+        ).fetchone()
+        if row is None:
+            return None
+        return PreviousContextCheck(
+            input_tokens=row["input_tokens"],
+            checkpoint_fingerprint=row["checkpoint_fingerprint"],
+            awaiting_reset=bool(row["awaiting_reset"]),
+        )
+
+    def record_context_check(
+        self,
+        room_id: str,
+        agent: AgentName,
+        *,
+        input_tokens: int,
+        checkpoint_fingerprint: str,
+        task_id: str,
+    ) -> None:
+        now = self._clock()
+        with self._mutation():
+            task = self._connection.execute(
+                """
+                SELECT 1 FROM tasks
+                WHERE task_id = ? AND room_id = ? AND sender = ?
+                  AND kind = ?
+                """,
+                (
+                    task_id,
+                    room_id,
+                    agent.value,
+                    TaskKind.CONTEXT_CHECK.value,
+                ),
+            ).fetchone()
+            if task is None:
+                raise TaskConflictError(
+                    "context check state requires a matching context-check task"
+                )
+            self._connection.execute(
+                """
+                INSERT INTO context_check_state (
+                    room_id, agent, input_tokens, checkpoint_fingerprint,
+                    task_id, awaiting_reset, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 0, ?)
+                ON CONFLICT(room_id, agent) DO UPDATE SET
+                    input_tokens = excluded.input_tokens,
+                    checkpoint_fingerprint = excluded.checkpoint_fingerprint,
+                    task_id = excluded.task_id,
+                    awaiting_reset = 0,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    room_id,
+                    agent.value,
+                    input_tokens,
+                    checkpoint_fingerprint,
+                    task_id,
+                    now,
+                ),
+            )
+
+    def clear_context_check(
+        self,
+        room_id: str,
+        agent: AgentName,
+    ) -> None:
+        with self._mutation():
+            self._connection.execute(
+                "DELETE FROM context_check_state WHERE room_id = ? AND agent = ?",
+                (room_id, agent.value),
+            )
+
+    def waiting_context_check(
+        self,
+        room_id: str,
+        sender: AgentName,
+    ) -> TaskView | None:
+        row = self._connection.execute(
+            """
+            SELECT * FROM tasks
+            WHERE room_id = ? AND sender = ? AND kind = ? AND state = ?
+            ORDER BY fifo_sequence DESC
+            LIMIT 1
+            """,
+            (
+                room_id,
+                sender.value,
+                TaskKind.CONTEXT_CHECK.value,
+                TaskState.WAITING_CHECKPOINT.value,
+            ),
+        ).fetchone()
+        return None if row is None else self._task_from_row(row)
+
+    def resume_context_check(
+        self,
+        task_id: str,
+        sender: AgentName,
+        *,
+        checkpoint_docs: tuple[str, ...],
+        question: str,
+    ) -> TaskView:
+        now = self._clock()
+        with self._mutation():
+            task = self._connection.execute(
+                "SELECT * FROM tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if task is None:
+                raise TaskConflictError(f"unknown task {task_id}")
+            if (
+                task["sender"] != sender.value
+                or task["kind"] != TaskKind.CONTEXT_CHECK.value
+            ):
+                raise TaskConflictError(
+                    "only the context-check sender may continue the task"
+                )
+            if task["state"] != TaskState.WAITING_CHECKPOINT.value:
+                raise TaskConflictError(
+                    "context check is not waiting for checkpoint records"
+                )
+
+            round_no = task["round_no"] + 1
+            self._connection.execute(
+                """
+                UPDATE tasks
+                SET checkpoint_docs_json = ?, question = ?, state = ?,
+                    round_no = ?, updated_at = ?
+                WHERE task_id = ?
+                """,
+                (
+                    _json_dump(list(checkpoint_docs)),
+                    question,
+                    TaskState.WORKING.value,
+                    round_no,
+                    now,
+                    task_id,
+                ),
+            )
+            updated = self._connection.execute(
+                "SELECT * FROM tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            self._insert_request_message(updated, now)
+            return self._task_from_row(updated)
+
     def _activate_next(self, room_id: str, now: float) -> None:
         active = self._connection.execute(
             """
@@ -1005,6 +1173,11 @@ class SQLiteStore:
                         sender=message_sender,
                         recipient=message_recipient,
                         body=row["body"],
+                        outcome=(
+                            None
+                            if row["outcome"] is None
+                            else TaskOutcome(row["outcome"])
+                        ),
                         lease_token=lease_token,
                     )
         except sqlite3.OperationalError as error:
@@ -1149,6 +1322,18 @@ class SQLiteStore:
                     """,
                     (next_state.value, now, task_id),
                 )
+                if (
+                    task["kind"] == TaskKind.CONTEXT_CHECK.value
+                    and outcome is TaskOutcome.COMPACT_READY
+                ):
+                    self._connection.execute(
+                        """
+                        UPDATE context_check_state
+                        SET awaiting_reset = 1, updated_at = ?
+                        WHERE task_id = ?
+                        """,
+                        (now, task_id),
+                    )
                 if is_terminal:
                     self._activate_next(task["room_id"], now)
                 return ReplyResult(message_id, task_id, next_state)

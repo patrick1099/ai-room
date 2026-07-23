@@ -18,7 +18,9 @@ from ai_room.domain import (
     TaskKind,
     TaskOutcome,
     TaskRequest,
+    TaskState,
 )
+from ai_room.context.base import ContextAdapter
 from ai_room.service import AiRoomService
 from ai_room.storage import PeerNotJoinedError, SQLiteStore, TaskConflictError
 
@@ -35,6 +37,16 @@ class FakeClock:
     def advance(self, seconds: float) -> None:
         with self._lock:
             self.current += seconds
+
+
+class FixedContextAdapter(ContextAdapter):
+    def __init__(self, result: ContextSample) -> None:
+        self.result = result
+        self.calls = 0
+
+    def sample(self) -> ContextSample:
+        self.calls += 1
+        return self.result
 
 
 @pytest.fixture
@@ -110,13 +122,14 @@ def service_pair(
 def _wait_in_thread(
     service: AiRoomService,
     cancel_event: threading.Event | None = None,
+    checkpoint_docs: tuple[Path, ...] = (),
 ) -> tuple[threading.Thread, list[object]]:
     cancel = cancel_event or threading.Event()
     results: list[object] = []
 
     def run() -> None:
         try:
-            results.append(service.wait(cancel))
+            results.append(service.wait(cancel, checkpoint_docs))
         except BaseException as error:
             results.append(error)
 
@@ -608,3 +621,281 @@ def test_leave_preserves_tasks_and_messages(
         (sent.task_id,),
     ).fetchone()[0]
     assert message_count == 1
+
+
+def test_wait_delivers_pending_message_before_sampling_context(
+    service_pair,
+    task_request: TaskRequest,
+) -> None:
+    primary, advisor = service_pair
+    adapter = FixedContextAdapter(
+        ContextSample(
+            input_tokens=180_000,
+            context_window=258_000,
+            source=ContextSource.CODEX_TOKEN_COUNT,
+            session_id="codex-session",
+        )
+    )
+    advisor._context_adapter = adapter
+    sent = primary.send(task_request)
+
+    delivery = advisor.wait(threading.Event())
+
+    assert delivery is not None
+    assert delivery.task_id == sent.task_id
+    assert adapter.calls == 0
+
+
+def test_wait_enqueues_context_check_with_current_sample_and_exact_checkpoint(
+    tmp_path: Path,
+    room: RoomRef,
+    fake_clock: FakeClock,
+) -> None:
+    database = tmp_path / "context-check.sqlite3"
+    primary_store = SQLiteStore.open(database, fake_clock)
+    advisor_store = SQLiteStore.open(database, fake_clock)
+    checkpoint = room.root / "docs" / "checkpoint.md"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_text("safe boundary", encoding="utf-8")
+    adapter = FixedContextAdapter(
+        ContextSample(
+            input_tokens=180_000,
+            context_window=258_000,
+            source=ContextSource.CODEX_TOKEN_COUNT,
+            session_id="codex-session",
+        )
+    )
+    primary = AiRoomService(
+        primary_store,
+        room,
+        AgentName.CODEX,
+        session_id="codex-session",
+        clock=fake_clock,
+        poll_seconds=0.01,
+        context_adapter=adapter,
+    )
+    advisor = AiRoomService(
+        advisor_store,
+        room,
+        AgentName.CLAUDE,
+        session_id="claude-session",
+        clock=fake_clock,
+        poll_seconds=0.01,
+    )
+    primary.join()
+    advisor.join()
+    cancel = threading.Event()
+    wait_thread, wait_results = _wait_in_thread(
+        primary,
+        cancel,
+        (Path("docs/checkpoint.md"),),
+    )
+    try:
+        request = advisor.wait(threading.Event())
+        assert request is not None
+        task = advisor._store.get_task(request.task_id)
+        assert task.request.kind is TaskKind.CONTEXT_CHECK
+        assert task.request.context.input_tokens == 180_000
+        assert task.request.context.context_window == 258_000
+        assert task.request.context.source is ContextSource.CODEX_TOKEN_COUNT
+        assert task.request.checkpoint_docs == ("docs/checkpoint.md",)
+        assert "codex" in task.request.question
+        assert "180000" in task.request.question
+        assert "258000" in task.request.question
+        assert "docs/checkpoint.md" in task.request.question
+    finally:
+        cancel.set()
+        wait_thread.join(timeout=2)
+        primary_store.close()
+        advisor_store.close()
+    assert wait_results == [None]
+
+
+def test_context_check_without_joined_peer_is_actionable(
+    tmp_path: Path,
+    room: RoomRef,
+    fake_clock: FakeClock,
+) -> None:
+    store = SQLiteStore.open(tmp_path / "no-peer.sqlite3", fake_clock)
+    adapter = FixedContextAdapter(
+        ContextSample(
+            input_tokens=200_001,
+            context_window=258_000,
+            source=ContextSource.CODEX_TOKEN_COUNT,
+            session_id="codex-session",
+        )
+    )
+    primary = AiRoomService(
+        store,
+        room,
+        AgentName.CODEX,
+        session_id="codex-session",
+        clock=fake_clock,
+        context_adapter=adapter,
+    )
+    primary.join()
+    cancelled = threading.Event()
+    try:
+        with pytest.raises(PeerNotJoinedError, match="join.*context check"):
+            primary.wait(cancelled, (Path("docs/checkpoint.md"),))
+    finally:
+        store.close()
+
+
+def test_checkpoint_needed_can_resume_same_task_for_another_round(
+    tmp_path: Path,
+    room: RoomRef,
+    fake_clock: FakeClock,
+) -> None:
+    database = tmp_path / "checkpoint-round.sqlite3"
+    primary_store = SQLiteStore.open(database, fake_clock)
+    advisor_store = SQLiteStore.open(database, fake_clock)
+    checkpoint = room.root / "docs" / "checkpoint.md"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_text("round one", encoding="utf-8")
+    adapter = FixedContextAdapter(
+        ContextSample(
+            input_tokens=180_000,
+            context_window=258_000,
+            source=ContextSource.CODEX_TOKEN_COUNT,
+            session_id="codex-session",
+        )
+    )
+    primary = AiRoomService(
+        primary_store,
+        room,
+        AgentName.CODEX,
+        session_id="codex-session",
+        clock=fake_clock,
+        poll_seconds=0.01,
+        context_adapter=adapter,
+    )
+    advisor = AiRoomService(
+        advisor_store,
+        room,
+        AgentName.CLAUDE,
+        session_id="claude-session",
+        clock=fake_clock,
+        poll_seconds=0.01,
+    )
+    primary.join()
+    advisor.join()
+    first_cancel = threading.Event()
+    first_wait, first_results = _wait_in_thread(
+        primary,
+        first_cancel,
+        (Path("docs/checkpoint.md"),),
+    )
+    first = advisor.wait(threading.Event())
+    assert first is not None
+    advisor.reply(
+        first.task_id,
+        TaskOutcome.CHECKPOINT_NEEDED,
+        "missing: docs/checkpoint.md state",
+    )
+    first_reply = primary.wait(threading.Event())
+    assert first_reply is not None
+    assert "missing:" in first_reply.body
+    checkpoint.write_text("round two complete", encoding="utf-8")
+
+    resumed = primary.resume_context_check((Path("docs/checkpoint.md"),))
+
+    assert resumed.task_id == first.task_id
+    assert resumed.state is TaskState.WORKING
+    assert resumed.round_no == 2
+    follow_up = advisor.wait(threading.Event())
+    assert follow_up is not None
+    assert follow_up.task_id == first.task_id
+    assert "round 2" in follow_up.body
+    baseline = advisor_store.get_workspace_baseline(first.task_id, 2)
+    assert baseline is not None
+    first_cancel.set()
+    first_wait.join(timeout=2)
+    primary_store.close()
+    advisor_store.close()
+    assert first_results == [None]
+
+
+def test_compact_ready_reply_is_manual_and_contains_recovery_details(
+    tmp_path: Path,
+    room: RoomRef,
+    fake_clock: FakeClock,
+) -> None:
+    database = tmp_path / "compact-ready.sqlite3"
+    primary_store = SQLiteStore.open(database, fake_clock)
+    advisor_store = SQLiteStore.open(database, fake_clock)
+    checkpoint = room.root / "checkpoint.md"
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint.write_text("ready", encoding="utf-8")
+    adapter = FixedContextAdapter(
+        ContextSample(
+            input_tokens=205_000,
+            context_window=258_000,
+            source=ContextSource.CODEX_TOKEN_COUNT,
+            session_id="codex-session",
+        )
+    )
+    primary = AiRoomService(
+        primary_store,
+        room,
+        AgentName.CODEX,
+        session_id="codex-session",
+        clock=fake_clock,
+        poll_seconds=0.01,
+        context_adapter=adapter,
+    )
+    advisor = AiRoomService(
+        advisor_store,
+        room,
+        AgentName.CLAUDE,
+        session_id="claude-session",
+        clock=fake_clock,
+        poll_seconds=0.01,
+    )
+    primary.join()
+    advisor.join()
+    cancel = threading.Event()
+    thread, results = _wait_in_thread(
+        primary,
+        cancel,
+        (Path("checkpoint.md"),),
+    )
+    request = advisor.wait(threading.Event())
+    assert request is not None
+    cancel.set()
+    thread.join(timeout=2)
+    assert results == [None]
+
+    advisor.reply(request.task_id, TaskOutcome.COMPACT_READY, "safe now")
+    reminder = primary.wait(threading.Event())
+
+    assert reminder is not None
+    assert "manual" in reminder.body.lower()
+    assert "codex" in reminder.body
+    assert "205000" in reminder.body
+    assert "checkpoint.md" in reminder.body
+    assert "resume ai-room after compaction" in reminder.body
+    assert "/compact" not in reminder.body
+    assert primary_store.get_task(request.task_id).state is TaskState.COMPACT_READY
+    previous = primary_store.get_previous_context_check(
+        room.room_id,
+        AgentName.CODEX,
+    )
+    assert previous is not None
+    assert previous.awaiting_reset is True
+
+    checkpoint.write_text("changed after reminder", encoding="utf-8")
+    adapter.result = replace(adapter.result, input_tokens=215_000)
+    reset_cancel = threading.Event()
+    reset_thread, reset_results = _wait_in_thread(
+        primary,
+        reset_cancel,
+        (Path("checkpoint.md"),),
+    )
+    time.sleep(0.05)
+    assert primary.status().active_task is None
+    reset_cancel.set()
+    reset_thread.join(timeout=2)
+    assert reset_results == [None]
+    primary_store.close()
+    advisor_store.close()

@@ -9,17 +9,31 @@ from collections.abc import Callable
 from pathlib import Path
 from threading import Event
 
+from .context.base import ContextAdapter
+from .context.policy import (
+    CompactionAction,
+    checkpoint_fingerprint,
+    evaluate_compaction,
+)
 from .domain import (
     AgentName,
+    ContextSample,
     Delivery,
     MemberView,
+    MemberStatus,
     RoomRef,
     TaskKind,
     TaskOutcome,
     TaskRequest,
     TaskView,
 )
-from .storage import ReplyResult, RoomStatus, SQLiteStore, TaskConflictError
+from .storage import (
+    PeerNotJoinedError,
+    ReplyResult,
+    RoomStatus,
+    SQLiteStore,
+    TaskConflictError,
+)
 from .workspace_guard import (
     WorkspaceGuardError,
     capture_workspace,
@@ -44,6 +58,7 @@ class AiRoomService:
         stale_seconds: float = 15.0,
         process_id: int | None = None,
         waiter_token_factory: Callable[[], str] | None = None,
+        context_adapter: ContextAdapter | None = None,
     ) -> None:
         if poll_seconds <= 0:
             raise ValueError("poll_seconds must be positive")
@@ -66,6 +81,7 @@ class AiRoomService:
         self._waiter_token_factory = waiter_token_factory or (
             lambda: str(uuid.uuid4())
         )
+        self._context_adapter = context_adapter
 
     def join(self) -> MemberView:
         return self._store.join_member(
@@ -89,7 +105,6 @@ class AiRoomService:
         cancel_event: Event,
         checkpoint_docs: tuple[Path, ...] = (),
     ) -> Delivery | None:
-        del checkpoint_docs
         self._acknowledge_prior_reply()
         if cancel_event.is_set():
             return None
@@ -104,6 +119,19 @@ class AiRoomService:
         )
         next_heartbeat = self._clock() + self._heartbeat_seconds
         try:
+            delivery = self._claim_for_waiter(waiter_token)
+            if delivery is not None:
+                return delivery
+
+            waiting_check = self._store.waiting_context_check(
+                self._room.room_id,
+                self._agent,
+            )
+            if waiting_check is not None and checkpoint_docs:
+                self.resume_context_check(checkpoint_docs)
+            elif waiting_check is None:
+                self._maybe_request_context_check(checkpoint_docs)
+
             while True:
                 if cancel_event.is_set():
                     return None
@@ -121,16 +149,8 @@ class AiRoomService:
                         return None
                     next_heartbeat = now + self._heartbeat_seconds
 
-                delivery = self._store.claim_next_message(
-                    self._room.room_id,
-                    self._agent,
-                    lease_seconds=self._stale_seconds,
-                    session_id=self._session_id,
-                    waiter_pid=self._process_id,
-                    waiter_token=waiter_token,
-                )
+                delivery = self._claim_for_waiter(waiter_token)
                 if delivery is not None:
-                    self._capture_task_baseline(delivery)
                     return delivery
 
                 cancel_event.wait(self._poll_seconds)
@@ -160,7 +180,57 @@ class AiRoomService:
             result = compare_workspace(baseline, after, writable_docs)
             if result.violations:
                 raise WorkspaceGuardError(result.violations)
+        if (
+            task.request.kind is TaskKind.CONTEXT_CHECK
+            and outcome is TaskOutcome.COMPACT_READY
+        ):
+            body = self._manual_compaction_reminder(task, body)
         return self._store.reply(task_id, self._agent, outcome, body)
+
+    def resume_context_check(
+        self,
+        checkpoint_docs: tuple[Path, ...],
+    ) -> TaskView:
+        self._acknowledge_prior_reply()
+        task = self._store.waiting_context_check(
+            self._room.room_id,
+            self._agent,
+        )
+        if task is None:
+            raise TaskConflictError(
+                "no context check is waiting for checkpoint records"
+            )
+
+        normalized = normalize_exact_paths(self._room.root, checkpoint_docs)
+        fingerprint = checkpoint_fingerprint(
+            self._room.root,
+            tuple(Path(path) for path in normalized),
+        )
+        next_round = task.round_no + 1
+        question = (
+            f"Context checkpoint follow-up round {next_round} from "
+            f"{self._agent.value}. Re-check the exact checkpoint documents: "
+            f"{', '.join(normalized) if normalized else '(none)'}. "
+            "Reply CHECKPOINT_NEEDED with the remaining missing records, or "
+            "COMPACT_READY only when a manual compaction reminder is safe."
+        )
+        resumed = self._store.resume_context_check(
+            task.task_id,
+            self._agent,
+            checkpoint_docs=normalized,
+            question=question,
+        )
+        tokens = task.request.context.input_tokens
+        if tokens is None:
+            raise TaskConflictError("context-check task has no token baseline")
+        self._store.record_context_check(
+            self._room.room_id,
+            self._agent,
+            input_tokens=tokens,
+            checkpoint_fingerprint=fingerprint,
+            task_id=task.task_id,
+        )
+        return resumed
 
     def status(self) -> RoomStatus:
         return self._store.status(
@@ -192,6 +262,146 @@ class AiRoomService:
             task.task_id,
             task.round_no,
             snapshot,
+        )
+
+    def _claim_for_waiter(self, waiter_token: str) -> Delivery | None:
+        delivery = self._store.claim_next_message(
+            self._room.room_id,
+            self._agent,
+            lease_seconds=self._stale_seconds,
+            session_id=self._session_id,
+            waiter_pid=self._process_id,
+            waiter_token=waiter_token,
+        )
+        if delivery is not None:
+            self._capture_task_baseline(delivery)
+        return delivery
+
+    def _maybe_request_context_check(
+        self,
+        checkpoint_docs: tuple[Path, ...],
+    ) -> TaskView | None:
+        if self._context_adapter is None:
+            return None
+
+        sample = self._context_adapter.sample()
+        tokens = sample.input_tokens
+        previous = self._store.get_previous_context_check(
+            self._room.room_id,
+            self._agent,
+        )
+        if tokens is None:
+            return None
+        if previous is not None and tokens < previous.input_tokens:
+            self._store.clear_context_check(self._room.room_id, self._agent)
+            previous = None
+        if tokens < 150_000:
+            return None
+
+        normalized = normalize_exact_paths(self._room.root, checkpoint_docs)
+        fingerprint = checkpoint_fingerprint(
+            self._room.root,
+            tuple(Path(path) for path in normalized),
+        )
+        action = evaluate_compaction(sample, previous, fingerprint)
+        if action is CompactionAction.NONE:
+            return None
+
+        peer = (
+            AgentName.CLAUDE
+            if self._agent is AgentName.CODEX
+            else AgentName.CODEX
+        )
+        if (
+            self.status().members[peer].status
+            is MemberStatus.NEVER_JOINED
+        ):
+            raise PeerNotJoinedError(
+                f"{peer.value} must join the room before a context check "
+                "can be requested"
+            )
+
+        question = self._context_check_question(
+            sample,
+            normalized,
+            action,
+        )
+        request = TaskRequest(
+            room_id=self._room.room_id,
+            sender=self._agent,
+            recipient=peer,
+            kind=TaskKind.CONTEXT_CHECK,
+            question=question,
+            related_docs=normalized,
+            writable_docs=(),
+            context=sample,
+            checkpoint_docs=normalized,
+            next_entry="resume ai-room after compaction",
+            idempotency_key=(
+                f"context-check:{self._agent.value}:{tokens}:{fingerprint}"
+            ),
+        )
+        task = self._store.enqueue_task(request)
+        self._store.record_context_check(
+            self._room.room_id,
+            self._agent,
+            input_tokens=tokens,
+            checkpoint_fingerprint=fingerprint,
+            task_id=task.task_id,
+        )
+        return task
+
+    def _context_check_question(
+        self,
+        sample: ContextSample,
+        checkpoint_docs: tuple[str, ...],
+        action: CompactionAction,
+    ) -> str:
+        tokens = (
+            "unknown"
+            if sample.input_tokens is None
+            else str(sample.input_tokens)
+        )
+        context_window = (
+            "unknown"
+            if sample.context_window is None
+            else str(sample.context_window)
+        )
+        urgency = (
+            "URGENT: the primary must finish or pause the smallest safe unit "
+            "and record its checkpoint before any reminder. "
+            if action is CompactionAction.URGENT_CHECK
+            else ""
+        )
+        return (
+            f"{urgency}Evaluate the safe checkpoint boundary for "
+            f"{self._agent.value}. Input tokens: {tokens}. Context window: "
+            f"{context_window}. Sample source: {sample.source.value}. "
+            "Exact checkpoint documents: "
+            f"{', '.join(checkpoint_docs) if checkpoint_docs else '(none)'}. "
+            "Next entry: resume ai-room after compaction. Reply "
+            "CHECKPOINT_NEEDED with exact missing records, or COMPACT_READY "
+            "only to request a manual compaction reminder. Never compact "
+            "automatically."
+        )
+
+    @staticmethod
+    def _manual_compaction_reminder(task: TaskView, advisor_body: str) -> str:
+        tokens = (
+            "unknown"
+            if task.request.context.input_tokens is None
+            else str(task.request.context.input_tokens)
+        )
+        documents = (
+            ", ".join(task.request.checkpoint_docs)
+            if task.request.checkpoint_docs
+            else "(none)"
+        )
+        recovery = task.request.next_entry or "resume ai-room after compaction"
+        return (
+            f"Manual compaction reminder for {task.request.sender.value}. "
+            f"Tokens: {tokens}. Checkpoint documents: {documents}. "
+            f"Recovery entry: {recovery}. Advisor: {advisor_body}"
         )
 
     def _writable_docs_for(self, task: TaskView) -> tuple[str, ...]:

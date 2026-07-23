@@ -101,6 +101,7 @@ class Delivery:
     sender: AgentName
     recipient: AgentName
     body: str
+    outcome: TaskOutcome | None = None
     lease_token: str | None = None
 
 
