@@ -9,4 +9,3 @@
 
 - [需求清单](docs/NEEDS.md)
 - [设计文档](docs/superpowers/specs/2026-07-23-ai-room-design.md)
-
