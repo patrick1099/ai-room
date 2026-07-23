@@ -10,6 +10,7 @@ import argparse
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -23,6 +24,11 @@ from typing import Protocol, TextIO
 
 _HOOK_MODULE = "ai_room.hooks.claude_session_start"
 _HOOK_MATCHER = "startup|resume|clear|compact"
+_REPARSE_POINT_ATTRIBUTE = getattr(
+    stat,
+    "FILE_ATTRIBUTE_REPARSE_POINT",
+    0x400,
+)
 
 
 class InstallError(RuntimeError):
@@ -293,25 +299,27 @@ def _merge_settings(
             )
         settings = parsed
 
-    hooks_value = settings.get("hooks")
-    if hooks_value is None:
+    if "hooks" not in settings:
         hooks: dict[str, object] = {}
         settings["hooks"] = hooks
-    elif isinstance(hooks_value, dict):
-        hooks = hooks_value
     else:
-        raise InstallConflictError("Claude settings hooks must be a JSON object")
+        hooks_value = settings["hooks"]
+        if not isinstance(hooks_value, dict):
+            raise InstallConflictError(
+                "Claude settings hooks must be a JSON object"
+            )
+        hooks = hooks_value
 
-    session_value = hooks.get("SessionStart")
-    if session_value is None:
+    if "SessionStart" not in hooks:
         session_groups: list[object] = []
         hooks["SessionStart"] = session_groups
-    elif isinstance(session_value, list):
-        session_groups = session_value
     else:
-        raise InstallConflictError(
-            "Claude SessionStart hooks must be a JSON array"
-        )
+        session_value = hooks["SessionStart"]
+        if not isinstance(session_value, list):
+            raise InstallConflictError(
+                "Claude SessionStart hooks must be a JSON array"
+            )
+        session_groups = session_value
 
     exact_groups = 0
     for event, groups in hooks.items():
@@ -359,7 +367,7 @@ def _hook_commands(group: object) -> list[str]:
 
 
 def _path_state(path: Path) -> PathState:
-    if path.is_symlink():
+    if _is_reparse_point(path) or path.is_symlink():
         return PathState.OTHER
     if path.is_file():
         return PathState.FILE
@@ -368,6 +376,17 @@ def _path_state(path: Path) -> PathState:
     if path.exists():
         return PathState.OTHER
     return PathState.MISSING
+
+
+def _is_reparse_point(path: Path) -> bool:
+    return bool(_file_attributes(path) & _REPARSE_POINT_ATTRIBUTE)
+
+
+def _file_attributes(path: Path) -> int:
+    try:
+        return int(getattr(path.lstat(), "st_file_attributes", 0))
+    except OSError:
+        return 0
 
 
 def _default_source_skill() -> Path:

@@ -111,3 +111,32 @@ installer on base `2cc6d9d`.
   remains.
 - No real-home or isolated-home `--apply` was run. No Task 9 work or push was
   performed.
+
+## Final-review Windows and null-configuration follow-up
+
+- Present `null` review finding was verified for both `hooks` and
+  `hooks.SessionStart`. RED was `2 failed`, each with `DID NOT RAISE
+  InstallConflictError`. Settings merge now checks key membership separately
+  from value type: missing keys are initialized, while present `null` and
+  every other incompatible type are refused before writes. The two null and
+  two missing-key cases passed together as `4 passed in 0.16s`.
+- Windows junction/reparse review finding was verified with a simulated
+  `FILE_ATTRIBUTE_REPARSE_POINT` value on an otherwise real `.claude`
+  directory. RED was `1 failed` with `DID NOT RAISE InstallConflictError`.
+  Path classification now reads optional `st_file_attributes` through a small
+  helper, uses a guarded standard-library constant with the Windows `0x400`
+  fallback, and rejects reparse outputs or ancestors through the existing
+  preflight. This is compatible with Python 3.11 and non-Windows stat results.
+  Reparse refusal plus ordinary-directory acceptance passed as
+  `2 passed in 0.11s`.
+- Final focused installer suite: `31 passed in 0.71s`.
+- Final bounded full suite:
+  `python -m pytest -vv -o faulthandler_timeout=30` passed
+  `217 passed in 46.34s`.
+- `python -m compileall -q src\ai_room tests\test_install.py` and
+  `git diff --check` exited 0.
+- Eight final-review `%TEMP%\ai-room-task8-finalreview-*` directories were
+  removed after their resolved paths were checked to stay under `%TEMP%`;
+  none remains.
+- No real-home or isolated-home `--apply` was run. No Task 9 work or push was
+  performed.

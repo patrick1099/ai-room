@@ -196,6 +196,47 @@ def test_non_object_settings_json_is_refused(
         execute_install(_plan(home), FilesystemWriter())
 
 
+@pytest.mark.parametrize(
+    ("settings_data", "message"),
+    [
+        ({"hooks": None}, "hooks must be a JSON object"),
+        (
+            {"hooks": {"SessionStart": None}},
+            "SessionStart hooks must be a JSON array",
+        ),
+    ],
+)
+def test_present_null_hook_configuration_is_refused_before_any_write(
+    tmp_path: Path,
+    settings_data: dict[str, object],
+    message: str,
+) -> None:
+    home = tmp_path / "home"
+    settings = _write_settings(home, settings_data)
+    original = settings.read_bytes()
+
+    with pytest.raises(InstallConflictError, match=message):
+        execute_install(_plan(home), FilesystemWriter())
+
+    assert settings.read_bytes() == original
+    assert all(not path.exists() for path in _skill_paths(home))
+
+
+@pytest.mark.parametrize("settings_data", [{}, {"hooks": {}}])
+def test_missing_hook_keys_are_initialized(
+    tmp_path: Path,
+    settings_data: dict[str, object],
+) -> None:
+    home = tmp_path / "home"
+    _write_settings(home, settings_data)
+    plan = _plan(home)
+
+    execute_install(plan, FilesystemWriter())
+
+    installed = json.loads(_settings_path(home).read_text(encoding="utf-8"))
+    assert _ai_room_groups(installed) == [plan.session_start_group]
+
+
 def test_atomic_settings_failure_keeps_existing_file_and_cleans_temp(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -381,6 +422,52 @@ def test_non_directory_backup_ancestor_is_refused_before_any_write(
     assert blocked_parent.read_bytes() == b"user-owned backup ancestor"
     assert settings.read_bytes() == original_settings
     assert all(not path.exists() for path in _skill_paths(home))
+
+
+def test_windows_reparse_point_ancestor_is_refused_before_any_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "home"
+    reparse_ancestor = home / ".claude"
+    reparse_ancestor.mkdir(parents=True)
+    actual_file_attributes = getattr(
+        install_module,
+        "_file_attributes",
+        lambda path: 0,
+    )
+
+    def simulated_file_attributes(path: Path) -> int:
+        if path == reparse_ancestor:
+            return 0x400
+        return actual_file_attributes(path)
+
+    monkeypatch.setattr(
+        install_module,
+        "_file_attributes",
+        simulated_file_attributes,
+        raising=False,
+    )
+
+    with pytest.raises(InstallConflictError, match="ancestor is not a directory"):
+        execute_install(_plan(home), FilesystemWriter())
+
+    assert reparse_ancestor.is_dir()
+    assert all(not path.exists() for path in _skill_paths(home))
+    assert not _settings_path(home).exists()
+
+
+def test_ordinary_real_directory_ancestors_remain_valid(tmp_path: Path) -> None:
+    home = tmp_path / "ordinary home"
+    (home / ".codex" / "skills").mkdir(parents=True)
+    (home / ".claude" / "skills").mkdir(parents=True)
+
+    execute_install(_plan(home), FilesystemWriter())
+
+    assert all(
+        path.read_bytes() == SOURCE_SKILL.read_bytes()
+        for path in _skill_paths(home)
+    )
 
 
 def test_conflicting_ai_room_hook_command_is_refused(tmp_path: Path) -> None:
