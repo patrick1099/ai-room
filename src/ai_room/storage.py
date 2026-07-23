@@ -250,6 +250,40 @@ def _validate_request_payload(raw: str) -> dict[str, object]:
     return value
 
 
+def _validate_message_row(
+    row: sqlite3.Row,
+) -> tuple[AgentName, AgentName]:
+    message_type = row["message_type"]
+    if message_type not in ("request", "reply"):
+        raise ValueError("message_type must be request or reply")
+    sender = AgentName(row["sender"])
+    recipient = AgentName(row["recipient"])
+
+    if message_type == "request":
+        _validate_request_payload(row["payload_json"])
+        if row["outcome"] is not None:
+            raise ValueError("request outcome must be null")
+        return sender, recipient
+
+    payload = json.loads(row["payload_json"])
+    if not isinstance(payload, dict):
+        raise ValueError("payload must be an object")
+    payload_outcome = payload.get("outcome")
+    if not isinstance(payload_outcome, str):
+        raise ValueError("outcome must be a string")
+    stored_outcome = row["outcome"]
+    if not isinstance(stored_outcome, str):
+        raise ValueError("stored outcome must be a string")
+    if TaskOutcome(payload_outcome) is not TaskOutcome(stored_outcome):
+        raise ValueError("payload outcome does not match stored outcome")
+    payload_body = payload.get("body")
+    if not isinstance(payload_body, str):
+        raise ValueError("body must be a string")
+    if payload_body != row["body"]:
+        raise ValueError("payload body does not match stored body")
+    return sender, recipient
+
+
 class SQLiteStore:
     """Room-scoped state persisted in a versioned SQLite database."""
 
@@ -282,10 +316,12 @@ class SQLiteStore:
             connection.execute("PRAGMA journal_mode=WAL")
 
             if is_new:
-                connection.executescript(_SCHEMA)
-                connection.execute(
-                    "INSERT INTO schema_meta (singleton, schema_version) VALUES (1, ?)",
-                    (SCHEMA_VERSION,),
+                connection.executescript(
+                    "BEGIN IMMEDIATE;\n"
+                    f"{_SCHEMA}\n"
+                    "INSERT INTO schema_meta (singleton, schema_version) "
+                    f"VALUES (1, {SCHEMA_VERSION});\n"
+                    "COMMIT;\n"
                 )
             return cls(connection, path, clock)
         except SchemaVersionError:
@@ -294,10 +330,26 @@ class SQLiteStore:
             raise
         except sqlite3.Error as error:
             if connection is not None:
+                if connection.in_transaction:
+                    connection.rollback()
                 connection.close()
+            if is_new:
+                cls._cleanup_failed_new_database(path)
             raise DatabaseOpenError(
                 f"cannot open database {path.name}: {type(error).__name__}"
             ) from error
+
+    @staticmethod
+    def _cleanup_failed_new_database(path: Path) -> None:
+        for candidate in (
+            path,
+            path.with_name(path.name + "-wal"),
+            path.with_name(path.name + "-shm"),
+        ):
+            try:
+                candidate.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     @staticmethod
     def _verify_existing_schema(connection: sqlite3.Connection) -> None:
@@ -626,29 +678,29 @@ class SQLiteStore:
                     """
                     SELECT * FROM messages
                     WHERE room_id = ?
-                      AND recipient = ?
+                      AND (
+                          recipient = ?
+                          OR recipient NOT IN (?, ?)
+                      )
                       AND acknowledged_at IS NULL
                       AND (delivered_at IS NULL OR lease_expires_at <= ?)
                     ORDER BY fifo_sequence
                     LIMIT 1
                     """,
-                    (room_id, recipient.value, now),
+                    (
+                        room_id,
+                        recipient.value,
+                        AgentName.CODEX.value,
+                        AgentName.CLAUDE.value,
+                        now,
+                    ),
                 ).fetchone()
                 if row is None:
                     return None
 
                 try:
-                    if row["message_type"] == "request":
-                        _validate_request_payload(row["payload_json"])
-                    else:
-                        payload = json.loads(row["payload_json"])
-                        if not isinstance(payload, dict):
-                            raise ValueError("payload must be an object")
-                        if not isinstance(payload.get("outcome"), str):
-                            raise ValueError("outcome must be a string")
-                        if not isinstance(payload.get("body"), str):
-                            raise ValueError("body must be a string")
-                except (json.JSONDecodeError, ValueError) as error:
+                    message_sender, message_recipient = _validate_message_row(row)
+                except (json.JSONDecodeError, TypeError, ValueError) as error:
                     reason = str(error)
                     self._quarantine_message(row, reason, now)
                     malformed = (row["message_id"], reason)
@@ -666,8 +718,8 @@ class SQLiteStore:
                         message_id=row["message_id"],
                         task_id=row["task_id"],
                         room_id=row["room_id"],
-                        sender=AgentName(row["sender"]),
-                        recipient=AgentName(row["recipient"]),
+                        sender=message_sender,
+                        recipient=message_recipient,
                         body=row["body"],
                         lease_token=lease_token,
                     )

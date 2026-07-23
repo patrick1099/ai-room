@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from ai_room import storage as storage_module
 from ai_room.domain import (
     AgentName,
     ContextSample,
@@ -176,6 +177,26 @@ def test_schema_version_mismatch_is_refused_without_mutation(
 
     assert path.read_bytes() == original
     assert not path.with_name(path.name + "-wal").exists()
+
+
+def test_failed_new_schema_initialization_leaves_no_partial_database(
+    tmp_path: Path,
+    clock: FakeClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "broken-init.sqlite3"
+    monkeypatch.setattr(
+        storage_module,
+        "_SCHEMA",
+        "CREATE TABLE partial_schema (value TEXT);\nINVALID SQL;",
+    )
+
+    with pytest.raises(DatabaseOpenError):
+        SQLiteStore.open(path, clock)
+
+    assert not path.exists()
+    assert not path.with_name(path.name + "-wal").exists()
+    assert not path.with_name(path.name + "-shm").exists()
 
 
 def test_real_write_lock_maps_to_database_busy_error(
@@ -505,3 +526,72 @@ def test_malformed_request_is_quarantined_and_next_task_activates(
     )
     assert valid is not None
     assert valid.task_id == second.task_id
+
+
+@pytest.mark.parametrize(
+    ("column", "invalid_value"),
+    [
+        ("message_type", "unknown"),
+        ("sender", "intruder"),
+        ("recipient", "intruder"),
+    ],
+)
+def test_invalid_request_enums_are_quarantined_and_next_task_activates(
+    joined_store: SQLiteStore,
+    task_request: TaskRequest,
+    column: str,
+    invalid_value: str,
+) -> None:
+    first = joined_store.enqueue_task(task_request)
+    second = joined_store.enqueue_task(
+        replace(task_request, idempotency_key="request-二", question="仍然有效")
+    )
+    joined_store._connection.execute("PRAGMA ignore_check_constraints=ON")
+    joined_store._connection.execute(
+        f"UPDATE messages SET {column} = ? WHERE task_id = ?",
+        (invalid_value, first.task_id),
+    )
+
+    with pytest.raises(MalformedMessageError):
+        joined_store.claim_next_message(
+            first.room_id, AgentName.CLAUDE, lease_seconds=60
+        )
+
+    assert joined_store.get_task(first.task_id).state is TaskState.BLOCKED
+    assert joined_store.get_task(second.task_id).state is TaskState.WORKING
+
+
+def test_invalid_reply_outcome_is_quarantined_and_next_task_activates(
+    joined_store: SQLiteStore,
+    task_request: TaskRequest,
+) -> None:
+    first = joined_store.enqueue_task(task_request)
+    second = joined_store.enqueue_task(
+        replace(task_request, idempotency_key="request-二", question="仍然有效")
+    )
+    joined_store.reply(
+        first.task_id,
+        AgentName.CLAUDE,
+        TaskOutcome.CHECKPOINT_NEEDED,
+        "请先补齐工作节点",
+    )
+    joined_store._connection.execute(
+        """
+        UPDATE messages
+        SET outcome = ?, payload_json = ?
+        WHERE task_id = ? AND message_type = 'reply'
+        """,
+        (
+            "unknown",
+            json.dumps({"outcome": "unknown", "body": "损坏回复"}),
+            first.task_id,
+        ),
+    )
+
+    with pytest.raises(MalformedMessageError):
+        joined_store.claim_next_message(
+            first.room_id, AgentName.CODEX, lease_seconds=60
+        )
+
+    assert joined_store.get_task(first.task_id).state is TaskState.BLOCKED
+    assert joined_store.get_task(second.task_id).state is TaskState.WORKING
