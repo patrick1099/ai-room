@@ -625,6 +625,68 @@ def test_unsupported_binding_registry_schema_is_stable_json(
     assert registry.read_bytes() == original
 
 
+def test_weakened_v1_binding_schema_is_operational_json(
+    tmp_path: Path,
+) -> None:
+    import sqlite3
+
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    local_app_data = tmp_path / "runtime"
+    registry = local_app_data / "ai-room" / "bindings" / "index.sqlite3"
+    registry.parent.mkdir(parents=True)
+    connection = sqlite3.connect(registry)
+    connection.executescript(
+        """
+        CREATE TABLE schema_meta (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            schema_version INTEGER NOT NULL
+        );
+        INSERT INTO schema_meta VALUES (1, 1);
+        CREATE TABLE room_bindings (
+            root_key TEXT NOT NULL,
+            agent TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            explicit_name TEXT,
+            state TEXT NOT NULL,
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (root_key, agent, session_id)
+        );
+        """
+    )
+    connection.close()
+    environ = _session_environment(local_app_data, AgentName.CODEX)
+
+    status = _run_cli(workspace, environ, "status")
+
+    assert status.returncode == 3
+    error = _assert_one_json_object(status.stderr)["error"]
+    assert error["code"] == "binding_database_open_failed"
+
+
+def test_invalid_persisted_binding_state_is_operational_json(
+    cli_workspace,
+) -> None:
+    import sqlite3
+
+    workspace, local_app_data, codex_env, _ = cli_workspace
+    assert _run_cli(workspace, codex_env, "join", "codex").returncode == 0
+    registry = local_app_data / "ai-room" / "bindings" / "index.sqlite3"
+    connection = sqlite3.connect(registry)
+    connection.execute("PRAGMA ignore_check_constraints=ON")
+    connection.execute(
+        "UPDATE room_bindings SET state = 'invalid' WHERE agent = 'codex'"
+    )
+    connection.commit()
+    connection.close()
+
+    status = _run_cli(workspace, codex_env, "status")
+
+    assert status.returncode == 3
+    error = _assert_one_json_object(status.stderr)["error"]
+    assert error["code"] == "binding_database_open_failed"
+
+
 def test_guard_violation_is_json_and_exit_four(cli_workspace) -> None:
     workspace, _, codex_env, claude_env = cli_workspace
     assert _run_cli(workspace, codex_env, "join", "codex").returncode == 0

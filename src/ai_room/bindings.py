@@ -8,6 +8,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
+from math import isfinite
 from pathlib import Path
 
 from .domain import AgentName
@@ -63,12 +64,14 @@ class BindingDatabaseBusyError(BindingError):
     """A binding mutation could not acquire its short transaction."""
 
 
-_SCHEMA = """
+_SCHEMA_META_SQL = """
 CREATE TABLE schema_meta (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     schema_version INTEGER NOT NULL
-);
+)
+"""
 
+_ROOM_BINDINGS_SQL = """
 CREATE TABLE room_bindings (
     root_key TEXT NOT NULL,
     agent TEXT NOT NULL CHECK (agent IN ('codex', 'claude')),
@@ -77,8 +80,13 @@ CREATE TABLE room_bindings (
     state TEXT NOT NULL CHECK (state IN ('pending', 'active')),
     updated_at REAL NOT NULL,
     PRIMARY KEY (root_key, agent, session_id)
-);
+)
 """
+
+_EXPECTED_TABLE_SQL = {
+    "schema_meta": _SCHEMA_META_SQL,
+    "room_bindings": _ROOM_BINDINGS_SQL,
+}
 
 
 class BindingRegistry:
@@ -102,11 +110,9 @@ class BindingRegistry:
         clock: Callable[[], float],
     ) -> BindingRegistry:
         path = Path(path)
-        is_new = not path.exists()
         connection: sqlite3.Connection | None = None
         try:
-            if is_new:
-                path.parent.mkdir(parents=True, exist_ok=True)
+            path.parent.mkdir(parents=True, exist_ok=True)
             connection = sqlite3.connect(
                 path,
                 timeout=5.0,
@@ -114,22 +120,15 @@ class BindingRegistry:
                 check_same_thread=False,
             )
             connection.row_factory = sqlite3.Row
-            if not is_new:
-                cls._verify_existing_schema(connection)
             connection.execute("PRAGMA busy_timeout=5000")
             connection.execute("PRAGMA foreign_keys=ON")
+            cls._initialize_or_verify_schema(connection)
             connection.execute("PRAGMA journal_mode=WAL")
-            if is_new:
-                connection.executescript(
-                    "BEGIN IMMEDIATE;\n"
-                    f"{_SCHEMA}\n"
-                    "INSERT INTO schema_meta (singleton, schema_version) "
-                    f"VALUES (1, {BINDING_SCHEMA_VERSION});\n"
-                    "COMMIT;\n"
-                )
             return cls(connection, path, clock)
-        except BindingSchemaVersionError:
+        except BindingError:
             if connection is not None:
+                if connection.in_transaction:
+                    connection.rollback()
                 connection.close()
             raise
         except sqlite3.Error as error:
@@ -137,35 +136,108 @@ class BindingRegistry:
                 if connection.in_transaction:
                     connection.rollback()
                 connection.close()
+            if _is_busy(error):
+                raise BindingDatabaseBusyError(
+                    "binding registry remained busy for 5000 ms"
+                ) from error
             raise BindingDatabaseOpenError(
                 f"cannot open binding registry {path.name}: "
                 f"{type(error).__name__}"
             ) from error
 
+    @classmethod
+    def _initialize_or_verify_schema(
+        cls,
+        connection: sqlite3.Connection,
+    ) -> None:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            schema_objects = connection.execute(
+                """
+                SELECT name
+                FROM sqlite_schema
+                WHERE name NOT LIKE 'sqlite_%'
+                LIMIT 1
+                """
+            ).fetchone()
+            if schema_objects is None:
+                connection.execute(_SCHEMA_META_SQL)
+                connection.execute(_ROOM_BINDINGS_SQL)
+                connection.execute(
+                    """
+                    INSERT INTO schema_meta (singleton, schema_version)
+                    VALUES (1, ?)
+                    """,
+                    (BINDING_SCHEMA_VERSION,),
+                )
+            else:
+                cls._verify_existing_schema(connection)
+        except BaseException:
+            connection.rollback()
+            raise
+        else:
+            connection.commit()
+
     @staticmethod
     def _verify_existing_schema(connection: sqlite3.Connection) -> None:
         try:
-            row = connection.execute(
-                "SELECT schema_version FROM schema_meta WHERE singleton = 1"
-            ).fetchone()
+            rows = connection.execute(
+                "SELECT singleton, schema_version FROM schema_meta"
+            ).fetchall()
         except sqlite3.Error as error:
             if "no such table" in str(error).lower():
                 raise BindingSchemaVersionError(
                     "unsupported binding schema version: missing"
                 ) from error
             raise
-        if row is None or row[0] != BINDING_SCHEMA_VERSION:
-            found = "missing" if row is None else row[0]
+        version_row = next(
+            (
+                row
+                for row in rows
+                if type(row["singleton"]) is int and row["singleton"] == 1
+            ),
+            None,
+        )
+        if (
+            version_row is None
+            or type(version_row["schema_version"]) is not int
+            or version_row["schema_version"] != BINDING_SCHEMA_VERSION
+        ):
+            found = (
+                "missing"
+                if version_row is None
+                else version_row["schema_version"]
+            )
             raise BindingSchemaVersionError(
                 f"unsupported binding schema version: {found}"
             )
-        connection.execute(
+        if len(rows) != 1:
+            raise BindingDatabaseOpenError(
+                "binding registry schema metadata is invalid"
+            )
+
+        table_rows = connection.execute(
             """
-            SELECT root_key, agent, session_id, explicit_name, state, updated_at
-            FROM room_bindings
-            LIMIT 0
+            SELECT name, sql
+            FROM sqlite_schema
+            WHERE type = 'table' AND name IN ('schema_meta', 'room_bindings')
             """
-        )
+        ).fetchall()
+        table_sql = {row["name"]: row["sql"] for row in table_rows}
+        if set(table_sql) != set(_EXPECTED_TABLE_SQL):
+            raise BindingDatabaseOpenError(
+                "binding registry schema is incomplete"
+            )
+        for table_name, expected_sql in _EXPECTED_TABLE_SQL.items():
+            actual_sql = table_sql[table_name]
+            if (
+                not isinstance(actual_sql, str)
+                or _normalize_schema_sql(actual_sql)
+                != _normalize_schema_sql(expected_sql)
+            ):
+                raise BindingDatabaseOpenError(
+                    f"binding registry table {table_name} is invalid"
+                )
 
     def close(self) -> None:
         self._connection.close()
@@ -338,14 +410,41 @@ def binding_registry_path(runtime_directory: Path) -> Path:
 def _binding_from_row(row: sqlite3.Row | None) -> RoomBinding:
     if row is None:
         raise BindingDatabaseOpenError("binding registry row is missing")
-    return RoomBinding(
-        root_key=row["root_key"],
-        agent=AgentName(row["agent"]),
-        session_id=row["session_id"],
-        explicit_name=row["explicit_name"],
-        state=BindingState(row["state"]),
-        updated_at=row["updated_at"],
-    )
+    try:
+        root_key = row["root_key"]
+        agent = row["agent"]
+        session_id = row["session_id"]
+        explicit_name = row["explicit_name"]
+        state = row["state"]
+        updated_at = row["updated_at"]
+        if not isinstance(root_key, str) or not root_key:
+            raise TypeError("invalid root key")
+        if not isinstance(agent, str):
+            raise TypeError("invalid agent")
+        if not isinstance(session_id, str) or not session_id:
+            raise TypeError("invalid session ID")
+        if explicit_name is not None and not isinstance(explicit_name, str):
+            raise TypeError("invalid room name")
+        if not isinstance(state, str):
+            raise TypeError("invalid binding state")
+        if (
+            isinstance(updated_at, bool)
+            or not isinstance(updated_at, (int, float))
+            or not isfinite(float(updated_at))
+        ):
+            raise TypeError("invalid update time")
+        return RoomBinding(
+            root_key=root_key,
+            agent=AgentName(agent),
+            session_id=session_id,
+            explicit_name=explicit_name,
+            state=BindingState(state),
+            updated_at=float(updated_at),
+        )
+    except (IndexError, KeyError, TypeError, ValueError) as error:
+        raise BindingDatabaseOpenError(
+            "binding registry contains invalid row data"
+        ) from error
 
 
 def _validate_key(root_key: str, session_id: str) -> None:
@@ -358,3 +457,7 @@ def _validate_key(root_key: str, session_id: str) -> None:
 def _is_busy(error: sqlite3.OperationalError) -> bool:
     message = str(error).lower()
     return "locked" in message or "busy" in message
+
+
+def _normalize_schema_sql(sql: str) -> str:
+    return "".join(sql.lower().split())
