@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from dataclasses import replace
@@ -516,3 +517,75 @@ def test_main_check_uses_isolated_home_and_reports_without_writes(
     assert payload["mode"] == "check"
     assert len(payload["operations"]) == 3
     assert not home.exists()
+
+
+def test_non_editable_install_uses_skill_matching_repository_source(
+    tmp_path: Path,
+) -> None:
+    installed_target = tmp_path / "installed target"
+    isolated_home = tmp_path / "isolated home"
+    install_result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--no-deps",
+            "--no-build-isolation",
+            "--target",
+            str(installed_target),
+            str(REPOSITORY_ROOT),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert install_result.returncode == 0, (
+        install_result.stdout + install_result.stderr
+    )
+
+    installed_environment = os.environ.copy()
+    installed_environment["HOME"] = str(isolated_home)
+    installed_environment["USERPROFILE"] = str(isolated_home)
+    installed_environment["PYTHONPATH"] = str(installed_target)
+    check_result = subprocess.run(
+        [sys.executable, "-m", "ai_room.install", "--check"],
+        cwd=tmp_path,
+        env=installed_environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert check_result.returncode == 0, check_result.stderr
+
+    packaged_skill = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from importlib.resources import files;"
+                "import sys;"
+                "sys.stdout.buffer.write("
+                "files('ai_room').joinpath('resources', 'SKILL.md').read_bytes()"
+                ")"
+            ),
+        ],
+        cwd=tmp_path,
+        env=installed_environment,
+        capture_output=True,
+        check=False,
+    )
+    assert packaged_skill.returncode == 0, packaged_skill.stderr.decode(
+        errors="replace"
+    )
+
+    source_bytes = SOURCE_SKILL.read_bytes()
+    assert packaged_skill.stdout == source_bytes
+    expected_hash = hashlib.sha256(source_bytes).hexdigest()
+    payload = json.loads(check_result.stdout)
+    assert [operation["sha256"] for operation in payload["operations"][:2]] == [
+        expected_hash,
+        expected_hash,
+    ]
+    assert not isolated_home.exists()

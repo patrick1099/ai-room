@@ -18,6 +18,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
+from importlib.resources import files
 from pathlib import Path
 from typing import Protocol, TextIO
 
@@ -138,16 +139,20 @@ class _PreparedWrite:
 def build_install_plan(
     home: Path,
     python_exe: Path,
-    source_skill: Path,
+    source_skill: Path | None = None,
 ) -> InstallPlan:
     """Build immutable destinations, source bytes, hook, and backup identity."""
     normalized_home = Path(home).expanduser()
     normalized_python = Path(python_exe)
-    normalized_source = Path(source_skill)
-    if _path_state(normalized_source) is not PathState.FILE:
-        raise InstallConflictError(
-            f"source skill is not a regular file: {normalized_source}"
-        )
+    if source_skill is None:
+        skill_bytes = _packaged_skill_bytes()
+    else:
+        normalized_source = Path(source_skill)
+        if _path_state(normalized_source) is not PathState.FILE:
+            raise InstallConflictError(
+                f"source skill is not a regular file: {normalized_source}"
+            )
+        skill_bytes = normalized_source.read_bytes()
 
     hook_command = subprocess.list2cmdline(
         [str(normalized_python), "-m", _HOOK_MODULE]
@@ -159,7 +164,7 @@ def build_install_plan(
     settings = normalized_home / ".claude" / "settings.json"
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     return InstallPlan(
-        skill_bytes=normalized_source.read_bytes(),
+        skill_bytes=skill_bytes,
         codex_skill=normalized_home / ".codex" / "skills" / "ai-room" / "SKILL.md",
         claude_skill=normalized_home / ".claude" / "skills" / "ai-room" / "SKILL.md",
         claude_settings=settings,
@@ -389,8 +394,8 @@ def _file_attributes(path: Path) -> int:
         return 0
 
 
-def _default_source_skill() -> Path:
-    return Path(__file__).resolve().parents[2] / "integrations" / "ai-room" / "SKILL.md"
+def _packaged_skill_bytes() -> bytes:
+    return files("ai_room").joinpath("resources", "SKILL.md").read_bytes()
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -422,7 +427,7 @@ def main(
         plan = build_install_plan(
             home or Path.home(),
             python_exe or Path(sys.executable),
-            source_skill or _default_source_skill(),
+            source_skill,
         )
         writer: InstallWriter
         writer = RecordingWriter() if arguments.check else FilesystemWriter()
