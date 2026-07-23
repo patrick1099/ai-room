@@ -1,0 +1,4 @@
+{"type":"user","sessionId":"session-123","cwd":"C:\\工作区\\ai room","message":{"role":"user","content":"脱敏测试"}}
+{"type":"assistant","sessionId":"session-123","message":{"role":"assistant","usage":{"input_tokens":80000,"cache_read_input_tokens":10000,"cache_creation_input_tokens":5000},"content":[]}}
+{"type":"user","sessionId":"session-123","message":{"role":"user","content":"继续"}}
+{"type":"assistant","sessionId":"session-123","message":{"role":"assistant","usage":{"input_tokens":120000,"cache_read_input_tokens":25000,"cache_creation_input_tokens":11000},"content":[]}}

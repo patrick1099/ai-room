@@ -1,0 +1,2 @@
+{"type":"user","sessionId":"session-123","cwd":"C:\\工作区\\ai room","message":{"role":"user","content":"脱敏测试"}}
+{"type":"assistant","sessionId":"session-123","message":{"role":"assistant","metrics":{"input_tokens":156000},"content":[]}}
