@@ -24,7 +24,7 @@ def resolve_room(
     resolver = git_toplevel or _git_toplevel
     root = resolver(resolved_cwd) or resolved_cwd
     resolved_root = root.resolve()
-    normalized_root = _normalize_root(resolved_root)
+    normalized_root = normalize_root(resolved_root)
     name = explicit_name or ""
     room_id = hashlib.sha256(f"{normalized_root}\0{name}".encode("utf-8")).hexdigest()[:24]
 
@@ -56,7 +56,8 @@ def _git_toplevel(cwd: Path) -> Path | None:
     return Path(output) if output else None
 
 
-def _normalize_root(root: Path) -> str:
+def normalize_root(root: Path) -> str:
+    """Return the one canonical worktree-root key used by room identities."""
     normalized = os.path.normpath(str(root)).replace("\\", "/")
     if os.name == "nt":
         return normalized.casefold()

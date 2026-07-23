@@ -8,15 +8,19 @@ import os
 import subprocess
 import sys
 import threading
+import time
 import types
 from pathlib import Path
 
 import pytest
 
 import ai_room.cli as cli
+import ai_room.paths as room_paths
 from ai_room.domain import AgentName
 from ai_room.domain import RoomRef
+from ai_room.paths import resolve_room, runtime_root
 from ai_room.service import AiRoomService
+from ai_room.storage import SQLiteStore
 
 
 PROJECT_ROOT = Path(__file__).parents[1]
@@ -27,6 +31,7 @@ def _session_environment(
     agent: AgentName,
     *,
     transcript: Path | None = None,
+    session_id: str | None = None,
 ) -> dict[str, str]:
     environ = os.environ.copy()
     environ["LOCALAPPDATA"] = str(local_app_data)
@@ -36,11 +41,11 @@ def _session_environment(
     environ.pop("AI_ROOM_CLAUDE_SESSION_ID", None)
     environ.pop("AI_ROOM_CLAUDE_TRANSCRIPT_PATH", None)
     if agent is AgentName.CODEX:
-        environ["CODEX_THREAD_ID"] = "codex-线程"
+        environ["CODEX_THREAD_ID"] = session_id or "codex-线程"
     else:
         if transcript is None:
             raise ValueError("Claude tests require a transcript")
-        environ["AI_ROOM_CLAUDE_SESSION_ID"] = "claude-会话"
+        environ["AI_ROOM_CLAUDE_SESSION_ID"] = session_id or "claude-会话"
         environ["AI_ROOM_CLAUDE_TRANSCRIPT_PATH"] = str(transcript)
     return environ
 
@@ -302,6 +307,324 @@ def test_unicode_and_repeated_exact_paths_round_trip_through_subprocess(
     assert sent.stderr == waited.stderr == ""
 
 
+def test_named_room_continues_through_all_commands_without_room_option(
+    cli_workspace,
+) -> None:
+    workspace, local_app_data, codex_env, claude_env = cli_workspace
+    codex_join = _run_cli(
+        workspace,
+        codex_env,
+        "join",
+        "codex",
+        "--room",
+        "中文评审室",
+    )
+    claude_join = _run_cli(
+        workspace,
+        claude_env,
+        "join",
+        "claude",
+        "--room",
+        "中文评审室",
+    )
+    codex_join_json = _assert_one_json_object(codex_join.stdout)
+    assert codex_join.returncode == claude_join.returncode == 0
+    assert (
+        _assert_one_json_object(claude_join.stdout)["room"]
+        == codex_join_json["room"]
+    )
+
+    status = _run_cli(workspace, codex_env, "status")
+    status_json = _assert_one_json_object(status.stdout)
+    assert status.returncode == 0
+    assert status_json["room"] == codex_join_json["room"]
+    assert status_json["result"]["members"]["claude"]["status"] == (
+        "joined_not_waiting"
+    )
+
+    sent = _run_cli(
+        workspace,
+        codex_env,
+        "send",
+        "--to",
+        "claude",
+        "--type",
+        "decision",
+        "--question",
+        "命名房间继续吗？",
+    )
+    task_id = _assert_one_json_object(sent.stdout)["result"]["task_id"]
+    delivered = _run_cli(workspace, claude_env, "wait")
+    assert _assert_one_json_object(delivered.stdout)["result"]["task_id"] == task_id
+    replied = _run_cli(
+        workspace,
+        claude_env,
+        "reply",
+        task_id,
+        "--outcome",
+        "done",
+        "--message",
+        "继续",
+    )
+    assert replied.returncode == 0
+    response = _run_cli(workspace, codex_env, "wait")
+    assert _assert_one_json_object(response.stdout)["result"]["message"] == "继续"
+
+    room_database = (
+        runtime_root(codex_env) / f"{codex_join_json['room']}.sqlite3"
+    )
+    assert room_database.exists()
+    assert _run_cli(workspace, claude_env, "leave").returncode == 0
+    assert _run_cli(workspace, codex_env, "leave").returncode == 0
+    assert room_database.exists()
+    history = SQLiteStore.open(room_database, time.time)
+    try:
+        assert history.get_task(task_id).task_id == task_id
+    finally:
+        history.close()
+
+    default_room = resolve_room(workspace)
+    assert default_room.room_id != codex_join_json["room"]
+    assert not (
+        runtime_root(codex_env) / f"{default_room.room_id}.sqlite3"
+    ).exists()
+
+
+def test_default_room_uses_binding_and_fresh_session_does_not_inherit_it(
+    cli_workspace,
+) -> None:
+    workspace, local_app_data, codex_env, _ = cli_workspace
+    joined = _run_cli(workspace, codex_env, "join", "codex")
+    joined_json = _assert_one_json_object(joined.stdout)
+    assert joined.returncode == 0
+    assert _run_cli(workspace, codex_env, "status").returncode == 0
+
+    fresh_env = _session_environment(
+        local_app_data,
+        AgentName.CODEX,
+        session_id="fresh-codex-session",
+    )
+    missing = _run_cli(workspace, fresh_env, "status")
+
+    assert missing.returncode == 3
+    assert missing.stdout == ""
+    assert _assert_one_json_object(missing.stderr)["error"] == {
+        "code": "room_binding_missing",
+        "message": "No room binding exists for this session; run ai-room join first.",
+    }
+    assert not (
+        runtime_root(codex_env)
+        / f"{resolve_room(workspace, 'unused').room_id}.sqlite3"
+    ).exists()
+    assert joined_json["room"] == resolve_room(workspace).room_id
+
+
+def test_sessions_on_same_root_keep_different_named_rooms_isolated(
+    cli_workspace,
+) -> None:
+    workspace, local_app_data, _, _ = cli_workspace
+    first_env = _session_environment(
+        local_app_data,
+        AgentName.CODEX,
+        session_id="codex-room-a",
+    )
+    second_env = _session_environment(
+        local_app_data,
+        AgentName.CODEX,
+        session_id="codex-room-b",
+    )
+    first = _run_cli(
+        workspace,
+        first_env,
+        "join",
+        "codex",
+        "--room",
+        "room-a",
+    )
+    second = _run_cli(
+        workspace,
+        second_env,
+        "join",
+        "codex",
+        "--room",
+        "room-b",
+    )
+    first_room = _assert_one_json_object(first.stdout)["room"]
+    second_room = _assert_one_json_object(second.stdout)["room"]
+
+    assert first.returncode == second.returncode == 0
+    assert first_room != second_room
+    assert _assert_one_json_object(
+        _run_cli(workspace, first_env, "status").stdout
+    )["room"] == first_room
+    assert _assert_one_json_object(
+        _run_cli(workspace, second_env, "status").stdout
+    )["room"] == second_room
+
+
+def test_binding_conflict_requires_leave_before_named_room_rejoin(
+    cli_workspace,
+) -> None:
+    workspace, _, codex_env, _ = cli_workspace
+    assert (
+        _run_cli(
+            workspace,
+            codex_env,
+            "join",
+            "codex",
+            "--room",
+            "first",
+        ).returncode
+        == 0
+    )
+
+    conflict = _run_cli(
+        workspace,
+        codex_env,
+        "join",
+        "codex",
+        "--room",
+        "second",
+    )
+
+    assert conflict.returncode == 3
+    assert _assert_one_json_object(conflict.stderr)["error"]["code"] == (
+        "room_binding_conflict"
+    )
+    assert _run_cli(workspace, codex_env, "leave").returncode == 0
+    replacement = _run_cli(
+        workspace,
+        codex_env,
+        "join",
+        "codex",
+        "--room",
+        "second",
+    )
+    assert replacement.returncode == 0
+    assert _assert_one_json_object(replacement.stdout)["room"] == (
+        resolve_room(workspace, "second").room_id
+    )
+
+
+def test_pending_binding_is_actionable_and_same_join_repairs_it(
+    cli_workspace,
+) -> None:
+    import importlib
+
+    bindings = importlib.import_module("ai_room.bindings")
+    workspace, _, codex_env, _ = cli_workspace
+    registry = bindings.BindingRegistry.open(
+        runtime_root(codex_env) / "bindings" / "index.sqlite3",
+        time.time,
+    )
+    try:
+        registry.reserve_binding(
+            room_paths.normalize_root(resolve_room(workspace).root),
+            AgentName.CODEX,
+            codex_env["CODEX_THREAD_ID"],
+            "repair-room",
+        )
+    finally:
+        registry.close()
+
+    incomplete = _run_cli(workspace, codex_env, "status")
+    assert incomplete.returncode == 3
+    assert _assert_one_json_object(incomplete.stderr)["error"]["code"] == (
+        "room_join_incomplete"
+    )
+
+    repaired = _run_cli(
+        workspace,
+        codex_env,
+        "join",
+        "codex",
+        "--room",
+        "repair-room",
+    )
+    assert repaired.returncode == 0
+    assert _run_cli(workspace, codex_env, "status").returncode == 0
+
+
+def test_missing_bound_room_database_is_not_recreated(
+    cli_workspace,
+) -> None:
+    workspace, _, codex_env, _ = cli_workspace
+    joined = _run_cli(
+        workspace,
+        codex_env,
+        "join",
+        "codex",
+        "--room",
+        "ephemeral",
+    )
+    room_id = _assert_one_json_object(joined.stdout)["room"]
+    database = runtime_root(codex_env) / f"{room_id}.sqlite3"
+    database.unlink()
+
+    status = _run_cli(workspace, codex_env, "status")
+
+    assert status.returncode == 3
+    assert _assert_one_json_object(status.stderr)["error"] == {
+        "code": "room_database_missing",
+        "message": "The bound room database is missing; leave and join again.",
+    }
+    assert not database.exists()
+    left = _run_cli(workspace, codex_env, "leave")
+    assert left.returncode == 0
+    assert not database.exists()
+
+
+def test_corrupt_binding_registry_is_actionable_and_not_rebuilt(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    local_app_data = tmp_path / "runtime"
+    registry = local_app_data / "ai-room" / "bindings" / "index.sqlite3"
+    registry.parent.mkdir(parents=True)
+    original = b"broken registry\x00\xff"
+    registry.write_bytes(original)
+    environ = _session_environment(local_app_data, AgentName.CODEX)
+
+    status = _run_cli(workspace, environ, "status")
+
+    assert status.returncode == 3
+    error = _assert_one_json_object(status.stderr)["error"]
+    assert error["code"] == "binding_database_open_failed"
+    assert str(tmp_path) not in error["message"]
+    assert registry.read_bytes() == original
+
+
+def test_unsupported_binding_registry_schema_is_stable_json(
+    tmp_path: Path,
+) -> None:
+    import sqlite3
+
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    local_app_data = tmp_path / "runtime"
+    registry = local_app_data / "ai-room" / "bindings" / "index.sqlite3"
+    registry.parent.mkdir(parents=True)
+    connection = sqlite3.connect(registry)
+    connection.execute(
+        "CREATE TABLE schema_meta "
+        "(singleton INTEGER PRIMARY KEY, schema_version INTEGER)"
+    )
+    connection.execute("INSERT INTO schema_meta VALUES (1, 99)")
+    connection.commit()
+    connection.close()
+    original = registry.read_bytes()
+    environ = _session_environment(local_app_data, AgentName.CODEX)
+
+    status = _run_cli(workspace, environ, "status")
+
+    assert status.returncode == 3
+    error = _assert_one_json_object(status.stderr)["error"]
+    assert error["code"] == "binding_schema_version_unsupported"
+    assert "99" in error["message"]
+    assert registry.read_bytes() == original
+
+
 def test_guard_violation_is_json_and_exit_four(cli_workspace) -> None:
     workspace, _, codex_env, claude_env = cli_workspace
     assert _run_cli(workspace, codex_env, "join", "codex").returncode == 0
@@ -387,6 +710,22 @@ def test_keyboard_interrupt_during_wait_returns_130_only(
         "ai-room wait interrupted; room membership and messages were "
         "preserved.\n"
     )
+    import importlib
+
+    bindings = importlib.import_module("ai_room.bindings")
+    registry = bindings.BindingRegistry.open(
+        runtime_root(environ) / "bindings" / "index.sqlite3",
+        time.time,
+    )
+    try:
+        active = registry.resolve_active_binding(
+            room_paths.normalize_root(resolve_room(workspace).root),
+            AgentName.CODEX,
+            environ["CODEX_THREAD_ID"],
+        )
+        assert active.state is bindings.BindingState.ACTIVE
+    finally:
+        registry.close()
 
 
 def test_keyboard_interrupt_outside_wait_is_not_swallowed(

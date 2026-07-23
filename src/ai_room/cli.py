@@ -17,6 +17,17 @@ from pathlib import Path
 from threading import Event
 from typing import TextIO
 
+from .bindings import (
+    BindingDatabaseBusyError,
+    BindingDatabaseOpenError,
+    BindingRegistry,
+    BindingSchemaVersionError,
+    RoomBindingConflictError,
+    RoomBindingMissingError,
+    RoomDatabaseMissingError,
+    RoomJoinIncompleteError,
+    binding_registry_path,
+)
 from .context import SessionDetectionError, adapter_for, detect_current_session
 from .domain import (
     AgentName,
@@ -28,7 +39,7 @@ from .domain import (
     TaskRequest,
     TaskView,
 )
-from .paths import resolve_room, runtime_root
+from .paths import normalize_root, resolve_room, runtime_root
 from .service import AiRoomService
 from .storage import (
     DatabaseBusyError,
@@ -200,6 +211,7 @@ def main(
     active_environ = os.environ if environ is None else environ
     active_cwd = Path.cwd() if cwd is None else Path(cwd)
     store: SQLiteStore | None = None
+    registry: BindingRegistry | None = None
     try:
         identity = detect_current_session(active_environ)
         requested_agent = (
@@ -208,27 +220,107 @@ def main(
             else identity.agent
         )
         adapter = adapter_for(requested_agent, active_environ)
-        room = resolve_room(
-            active_cwd,
-            arguments.room if arguments.command == "join" else None,
+        runtime_directory = runtime_root(active_environ)
+        registry = BindingRegistry.open(
+            binding_registry_path(runtime_directory),
+            time.time,
         )
-        database = runtime_root(active_environ) / f"{room.room_id}.sqlite3"
-        store = SQLiteStore.open(database, time.time)
-        service = AiRoomService(
-            store,
-            room,
-            requested_agent,
-            session_id=identity.session_id,
-            context_adapter=adapter,
-        )
-        result = _COMMANDS[arguments.command](
-            arguments,
-            service,
-            room.root,
-            adapter.sample,
-            errors,
-            identity.agent,
-        )
+        root = resolve_room(active_cwd).root
+        root_key = normalize_root(root)
+
+        if arguments.command == "join":
+            explicit_name = arguments.room or None
+            registry.reserve_binding(
+                root_key,
+                requested_agent,
+                identity.session_id,
+                explicit_name,
+            )
+            room = resolve_room(active_cwd, explicit_name)
+            database = runtime_directory / f"{room.room_id}.sqlite3"
+            store = SQLiteStore.open(database, time.time)
+            service = _build_service(
+                store,
+                room,
+                requested_agent,
+                identity.session_id,
+                adapter,
+            )
+            result = _invoke_command(
+                arguments,
+                service,
+                room.root,
+                adapter.sample,
+                errors,
+                identity.agent,
+            )
+            registry.activate_binding(
+                root_key,
+                requested_agent,
+                identity.session_id,
+                explicit_name,
+            )
+        elif arguments.command == "leave":
+            binding = registry.resolve_binding_for_leave(
+                root_key,
+                identity.agent,
+                identity.session_id,
+            )
+            room = resolve_room(active_cwd, binding.explicit_name)
+            database = runtime_directory / f"{room.room_id}.sqlite3"
+            if database.exists():
+                store = SQLiteStore.open(database, time.time)
+                service = _build_service(
+                    store,
+                    room,
+                    identity.agent,
+                    identity.session_id,
+                    adapter,
+                )
+                result = _invoke_command(
+                    arguments,
+                    service,
+                    room.root,
+                    adapter.sample,
+                    errors,
+                    identity.agent,
+                )
+            else:
+                result = _left_result(identity.agent)
+            registry.delete_binding(
+                root_key,
+                identity.agent,
+                identity.session_id,
+            )
+        else:
+            binding = registry.resolve_active_binding(
+                root_key,
+                identity.agent,
+                identity.session_id,
+            )
+            room = resolve_room(active_cwd, binding.explicit_name)
+            database = runtime_directory / f"{room.room_id}.sqlite3"
+            if not database.exists():
+                raise RoomDatabaseMissingError(
+                    "bound room database is missing"
+                )
+            store = SQLiteStore.open(database, time.time)
+            service = _build_service(
+                store,
+                room,
+                identity.agent,
+                identity.session_id,
+                adapter,
+            )
+            result = _invoke_command(
+                arguments,
+                service,
+                room.root,
+                adapter.sample,
+                errors,
+                identity.agent,
+            )
+
         if result is None:
             raise CliOperationalError(
                 "waiter_replaced",
@@ -248,6 +340,47 @@ def main(
         return EXIT_CANCEL
     except KeyboardInterrupt:
         raise
+    except RoomBindingMissingError:
+        _write_error(
+            errors,
+            "room_binding_missing",
+            "No room binding exists for this session; run ai-room join first.",
+        )
+        return EXIT_OPERATIONAL
+    except RoomJoinIncompleteError:
+        _write_error(
+            errors,
+            "room_join_incomplete",
+            "Room join is incomplete; repeat the same ai-room join command.",
+        )
+        return EXIT_OPERATIONAL
+    except RoomBindingConflictError:
+        _write_error(
+            errors,
+            "room_binding_conflict",
+            "This session is bound to another room; leave it before joining.",
+        )
+        return EXIT_OPERATIONAL
+    except RoomDatabaseMissingError:
+        _write_error(
+            errors,
+            "room_database_missing",
+            "The bound room database is missing; leave and join again.",
+        )
+        return EXIT_OPERATIONAL
+    except BindingSchemaVersionError as error:
+        _write_error(
+            errors,
+            "binding_schema_version_unsupported",
+            str(error),
+        )
+        return EXIT_OPERATIONAL
+    except BindingDatabaseOpenError as error:
+        _write_error(errors, "binding_database_open_failed", str(error))
+        return EXIT_OPERATIONAL
+    except BindingDatabaseBusyError as error:
+        _write_error(errors, "binding_database_busy", str(error))
+        return EXIT_OPERATIONAL
     except WorkspaceGuardError as error:
         _write_error(
             errors,
@@ -316,8 +449,46 @@ def main(
         _write_error(errors, "runtime_configuration", message)
         return EXIT_OPERATIONAL
     finally:
-        if store is not None:
-            store.close()
+        try:
+            if store is not None:
+                store.close()
+        finally:
+            if registry is not None:
+                registry.close()
+
+
+def _build_service(
+    store: SQLiteStore,
+    room,
+    agent: AgentName,
+    session_id: str,
+    adapter,
+) -> AiRoomService:
+    return AiRoomService(
+        store,
+        room,
+        agent,
+        session_id=session_id,
+        context_adapter=adapter,
+    )
+
+
+def _invoke_command(
+    arguments: argparse.Namespace,
+    service: AiRoomService,
+    root: Path,
+    sample_context,
+    errors: TextIO,
+    agent: AgentName,
+) -> dict[str, object] | None:
+    return _COMMANDS[arguments.command](
+        arguments,
+        service,
+        root,
+        sample_context,
+        errors,
+        agent,
+    )
 
 
 def _validate_arguments(arguments: argparse.Namespace) -> None:
@@ -463,6 +634,10 @@ def _command_leave(
     agent: AgentName,
 ) -> dict[str, object]:
     service.leave()
+    return _left_result(agent)
+
+
+def _left_result(agent: AgentName) -> dict[str, object]:
     label = _AGENT_LABELS[agent]
     return {
         "agent": agent.value,
