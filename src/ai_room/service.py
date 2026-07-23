@@ -104,6 +104,8 @@ class AiRoomService:
         self,
         cancel_event: Event,
         checkpoint_docs: tuple[Path, ...] = (),
+        *,
+        next_entry: str | None = None,
     ) -> Delivery | None:
         self._acknowledge_prior_reply()
         if cancel_event.is_set():
@@ -128,9 +130,15 @@ class AiRoomService:
                 self._agent,
             )
             if waiting_check is not None and checkpoint_docs:
-                self.resume_context_check(checkpoint_docs)
+                self.resume_context_check(
+                    checkpoint_docs,
+                    next_entry=next_entry,
+                )
             elif waiting_check is None:
-                self._maybe_request_context_check(checkpoint_docs)
+                self._maybe_request_context_check(
+                    checkpoint_docs,
+                    next_entry=next_entry,
+                )
 
             while True:
                 if cancel_event.is_set():
@@ -190,6 +198,8 @@ class AiRoomService:
     def resume_context_check(
         self,
         checkpoint_docs: tuple[Path, ...],
+        *,
+        next_entry: str | None = None,
     ) -> TaskView:
         self._acknowledge_prior_reply()
         task = self._store.waiting_context_check(
@@ -207,10 +217,12 @@ class AiRoomService:
             tuple(Path(path) for path in normalized),
         )
         next_round = task.round_no + 1
+        recovery_entry = next_entry or task.request.next_entry
         question = (
             f"Context checkpoint follow-up round {next_round} from "
             f"{self._agent.value}. Re-check the exact checkpoint documents: "
             f"{', '.join(normalized) if normalized else '(none)'}. "
+            f"Next entry: {recovery_entry or 'resume ai-room after compaction'}. "
             "Reply CHECKPOINT_NEEDED with the remaining missing records, or "
             "COMPACT_READY only when a manual compaction reminder is safe."
         )
@@ -237,6 +249,10 @@ class AiRoomService:
             self._room.room_id,
             stale_after_seconds=self._stale_seconds,
         )
+
+    def get_task(self, task_id: str) -> TaskView:
+        """Return one task so presentation layers can format a delivery."""
+        return self._store.get_task(task_id)
 
     def leave(self) -> None:
         self._store.leave_member(
@@ -280,6 +296,8 @@ class AiRoomService:
     def _maybe_request_context_check(
         self,
         checkpoint_docs: tuple[Path, ...],
+        *,
+        next_entry: str | None = None,
     ) -> TaskView | None:
         if self._context_adapter is None:
             return None
@@ -325,6 +343,7 @@ class AiRoomService:
             sample,
             normalized,
             action,
+            next_entry=next_entry,
         )
         request = TaskRequest(
             room_id=self._room.room_id,
@@ -336,7 +355,7 @@ class AiRoomService:
             writable_docs=(),
             context=sample,
             checkpoint_docs=normalized,
-            next_entry="resume ai-room after compaction",
+            next_entry=next_entry or "resume ai-room after compaction",
             idempotency_key=(
                 f"context-check:{self._agent.value}:{tokens}:{fingerprint}"
             ),
@@ -356,6 +375,8 @@ class AiRoomService:
         sample: ContextSample,
         checkpoint_docs: tuple[str, ...],
         action: CompactionAction,
+        *,
+        next_entry: str | None = None,
     ) -> str:
         tokens = (
             "unknown"
@@ -373,13 +394,14 @@ class AiRoomService:
             if action is CompactionAction.URGENT_CHECK
             else ""
         )
+        recovery_entry = next_entry or "resume ai-room after compaction"
         return (
             f"{urgency}Evaluate the safe checkpoint boundary for "
             f"{self._agent.value}. Input tokens: {tokens}. Context window: "
             f"{context_window}. Sample source: {sample.source.value}. "
             "Exact checkpoint documents: "
             f"{', '.join(checkpoint_docs) if checkpoint_docs else '(none)'}. "
-            "Next entry: resume ai-room after compaction. Reply "
+            f"Next entry: {recovery_entry}. Reply "
             "CHECKPOINT_NEEDED with exact missing records, or COMPACT_READY "
             "only to request a manual compaction reminder. Never compact "
             "automatically."
