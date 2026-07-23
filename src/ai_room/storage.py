@@ -333,23 +333,9 @@ class SQLiteStore:
                 if connection.in_transaction:
                     connection.rollback()
                 connection.close()
-            if is_new:
-                cls._cleanup_failed_new_database(path)
             raise DatabaseOpenError(
                 f"cannot open database {path.name}: {type(error).__name__}"
             ) from error
-
-    @staticmethod
-    def _cleanup_failed_new_database(path: Path) -> None:
-        for candidate in (
-            path,
-            path.with_name(path.name + "-wal"),
-            path.with_name(path.name + "-shm"),
-        ):
-            try:
-                candidate.unlink(missing_ok=True)
-            except OSError:
-                pass
 
     @staticmethod
     def _verify_existing_schema(connection: sqlite3.Connection) -> None:

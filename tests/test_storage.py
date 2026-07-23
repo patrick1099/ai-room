@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 import uuid
 from dataclasses import replace
@@ -179,7 +180,7 @@ def test_schema_version_mismatch_is_refused_without_mutation(
     assert not path.with_name(path.name + "-wal").exists()
 
 
-def test_failed_new_schema_initialization_leaves_no_partial_database(
+def test_failed_new_schema_initialization_rolls_back_without_deleting_database(
     tmp_path: Path,
     clock: FakeClock,
     monkeypatch: pytest.MonkeyPatch,
@@ -194,9 +195,70 @@ def test_failed_new_schema_initialization_leaves_no_partial_database(
     with pytest.raises(DatabaseOpenError):
         SQLiteStore.open(path, clock)
 
-    assert not path.exists()
-    assert not path.with_name(path.name + "-wal").exists()
-    assert not path.with_name(path.name + "-shm").exists()
+    assert path.exists()
+    connection = sqlite3.connect(path)
+    try:
+        names = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+    finally:
+        connection.close()
+    assert "partial_schema" not in names
+    assert "schema_meta" not in names
+
+    original = path.read_bytes()
+    with pytest.raises(SchemaVersionError, match="missing"):
+        SQLiteStore.open(path, clock)
+    assert path.exists()
+    assert path.read_bytes() == original
+
+
+def test_stale_new_database_observer_never_deletes_concurrent_success(
+    tmp_path: Path,
+    clock: FakeClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "concurrent.sqlite3"
+    stale_checked = threading.Event()
+    valid_ready = threading.Event()
+    original_exists = Path.exists
+    failures: list[Exception] = []
+
+    def coordinated_exists(candidate: Path) -> bool:
+        if candidate == path and threading.current_thread().name == "stale-opener":
+            stale_checked.set()
+            assert valid_ready.wait(timeout=5)
+            return False
+        return original_exists(candidate)
+
+    def open_with_stale_observation() -> None:
+        try:
+            SQLiteStore.open(path, clock)
+        except Exception as error:
+            failures.append(error)
+
+    monkeypatch.setattr(Path, "exists", coordinated_exists)
+    stale_opener = threading.Thread(
+        target=open_with_stale_observation,
+        name="stale-opener",
+    )
+    stale_opener.start()
+    assert stale_checked.wait(timeout=5)
+
+    valid_store = SQLiteStore.open(path, clock)
+    valid_store.close()
+    valid_ready.set()
+    stale_opener.join(timeout=5)
+
+    assert not stale_opener.is_alive()
+    assert len(failures) == 1
+    assert isinstance(failures[0], DatabaseOpenError)
+    assert path.exists()
+    reopened = SQLiteStore.open(path, clock)
+    reopened.close()
 
 
 def test_real_write_lock_maps_to_database_busy_error(
