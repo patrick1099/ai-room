@@ -24,6 +24,7 @@ from .domain import (
     TaskState,
     TaskView,
 )
+from .workspace_guard import WorkspaceSnapshot
 
 
 SCHEMA_VERSION = 1
@@ -181,6 +182,14 @@ CREATE TABLE quarantined_messages (
     reason TEXT NOT NULL,
     quarantined_at REAL NOT NULL
 );
+
+CREATE TABLE workspace_baselines (
+    task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
+    round_no INTEGER NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (task_id, round_no)
+);
 """
 
 
@@ -288,6 +297,22 @@ def _validate_message_row(
     if payload_body != row["body"]:
         raise ValueError("payload body does not match stored body")
     return sender, recipient
+
+
+def _workspace_snapshot_from_json(raw: str) -> WorkspaceSnapshot:
+    value = json.loads(raw)
+    if not isinstance(value, list):
+        raise ValueError("workspace snapshot must be a list")
+    files: list[tuple[str, str]] = []
+    for entry in value:
+        if (
+            not isinstance(entry, list)
+            or len(entry) != 2
+            or not all(isinstance(item, str) for item in entry)
+        ):
+            raise ValueError("workspace snapshot entry must contain path and hash")
+        files.append((entry[0], entry[1]))
+    return WorkspaceSnapshot(tuple(files))
 
 
 class SQLiteStore:
@@ -770,6 +795,63 @@ class SQLiteStore:
         if row is None:
             raise TaskConflictError(f"unknown task {task_id}")
         return self._task_from_row(row)
+
+    def record_workspace_baseline(
+        self,
+        task_id: str,
+        round_no: int,
+        snapshot: WorkspaceSnapshot,
+    ) -> WorkspaceSnapshot:
+        """Persist the first baseline for a round and return the durable value."""
+        payload = _json_dump(list(snapshot.files))
+        now = self._clock()
+        try:
+            with self._mutation():
+                task = self._connection.execute(
+                    "SELECT round_no FROM tasks WHERE task_id = ?",
+                    (task_id,),
+                ).fetchone()
+                if task is None:
+                    raise TaskConflictError(f"unknown task {task_id}")
+                if task["round_no"] != round_no:
+                    raise TaskConflictError("task round changed before baseline capture")
+                self._connection.execute(
+                    """
+                    INSERT OR IGNORE INTO workspace_baselines (
+                        task_id, round_no, snapshot_json, created_at
+                    ) VALUES (?, ?, ?, ?)
+                    """,
+                    (task_id, round_no, payload, now),
+                )
+                row = self._connection.execute(
+                    """
+                    SELECT snapshot_json FROM workspace_baselines
+                    WHERE task_id = ? AND round_no = ?
+                    """,
+                    (task_id, round_no),
+                ).fetchone()
+        except sqlite3.OperationalError as error:
+            if _is_busy(error):
+                raise DatabaseBusyError("database remained busy for 5000 ms") from error
+            raise
+        return _workspace_snapshot_from_json(row["snapshot_json"])
+
+    def get_workspace_baseline(
+        self,
+        task_id: str,
+        round_no: int,
+    ) -> WorkspaceSnapshot | None:
+        """Load a task-round baseline without opening a write transaction."""
+        row = self._connection.execute(
+            """
+            SELECT snapshot_json FROM workspace_baselines
+            WHERE task_id = ? AND round_no = ?
+            """,
+            (task_id, round_no),
+        ).fetchone()
+        if row is None:
+            return None
+        return _workspace_snapshot_from_json(row["snapshot_json"])
 
     def _task_from_row(self, row: sqlite3.Row) -> TaskView:
         return TaskView(

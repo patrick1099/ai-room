@@ -14,11 +14,18 @@ from .domain import (
     Delivery,
     MemberView,
     RoomRef,
+    TaskKind,
     TaskOutcome,
     TaskRequest,
     TaskView,
 )
 from .storage import ReplyResult, RoomStatus, SQLiteStore, TaskConflictError
+from .workspace_guard import (
+    WorkspaceGuardError,
+    capture_workspace,
+    compare_workspace,
+    normalize_exact_paths,
+)
 
 
 class AiRoomService:
@@ -123,6 +130,7 @@ class AiRoomService:
                     waiter_token=waiter_token,
                 )
                 if delivery is not None:
+                    self._capture_task_baseline(delivery)
                     return delivery
 
                 cancel_event.wait(self._poll_seconds)
@@ -142,6 +150,16 @@ class AiRoomService:
         body: str,
     ) -> ReplyResult:
         self._acknowledge_prior_reply()
+        task = self._store.get_task(task_id)
+        if task.request.recipient is self._agent:
+            baseline = self._store.get_workspace_baseline(task_id, task.round_no)
+            if baseline is None:
+                raise TaskConflictError("task round has no workspace baseline")
+            after = capture_workspace(self._room.root)
+            writable_docs = self._writable_docs_for(task)
+            result = compare_workspace(baseline, after, writable_docs)
+            if result.violations:
+                raise WorkspaceGuardError(result.violations)
         return self._store.reply(task_id, self._agent, outcome, body)
 
     def status(self) -> RoomStatus:
@@ -162,4 +180,24 @@ class AiRoomService:
             self._room.room_id,
             self._agent,
             session_id=self._session_id,
+        )
+
+    def _capture_task_baseline(self, delivery: Delivery) -> None:
+        task = self._store.get_task(delivery.task_id)
+        if task.request.recipient is not self._agent:
+            return
+        self._writable_docs_for(task)
+        snapshot = capture_workspace(self._room.root)
+        self._store.record_workspace_baseline(
+            task.task_id,
+            task.round_no,
+            snapshot,
+        )
+
+    def _writable_docs_for(self, task: TaskView) -> tuple[str, ...]:
+        if task.request.kind in (TaskKind.DECISION, TaskKind.CONTEXT_CHECK):
+            return ()
+        return normalize_exact_paths(
+            self._room.root,
+            (Path(path) for path in task.request.writable_docs),
         )
