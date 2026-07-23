@@ -79,6 +79,12 @@ class TaskView:
     task_id: str
     request: TaskRequest
     state: TaskState
+    round_no: int = 1
+    blocked_reason: str | None = None
+
+    @property
+    def room_id(self) -> str:
+        return self.request.room_id
 
 
 @dataclass(frozen=True)
@@ -89,6 +95,7 @@ class Delivery:
     sender: AgentName
     recipient: AgentName
     body: str
+    lease_token: str | None = None
 
 
 @dataclass(frozen=True)
