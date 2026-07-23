@@ -31,6 +31,14 @@ class WorkspaceGuardError(RuntimeError):
         super().__init__(f"workspace changes outside writable_docs: {changed}")
 
 
+class WorkspaceCaptureError(RuntimeError):
+    """Raised when a Git workspace cannot be captured without widening scope."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(f"cannot safely capture Git workspace: {reason}")
+
+
 def normalize_exact_paths(
     root: Path,
     paths: Iterable[Path],
@@ -127,6 +135,7 @@ def compare_workspace(
 
 
 def _git_workspace_paths(root: Path) -> tuple[str, ...] | None:
+    has_git_marker = _has_git_marker(root)
     try:
         top_level = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
@@ -135,13 +144,19 @@ def _git_workspace_paths(root: Path) -> tuple[str, ...] | None:
             capture_output=True,
             check=False,
         )
-    except OSError:
+    except OSError as error:
+        if has_git_marker:
+            raise WorkspaceCaptureError("git_unavailable") from error
         return None
     if top_level.returncode != 0:
+        if has_git_marker:
+            raise WorkspaceCaptureError("git_inspection_failed")
         return None
 
     output = os.fsdecode(top_level.stdout).strip()
     if not output or _path_key(str(Path(output).resolve())) != _path_key(str(root)):
+        if has_git_marker:
+            raise WorkspaceCaptureError("git_inspection_failed")
         return None
 
     tracked = _run_git_file_list(root, ["ls-files", "-z"])
@@ -153,21 +168,28 @@ def _git_workspace_paths(root: Path) -> tuple[str, ...] | None:
 
 
 def _run_git_file_list(root: Path, arguments: list[str]) -> tuple[str, ...]:
-    result = subprocess.run(
-        ["git", *arguments],
-        cwd=root,
-        shell=False,
-        capture_output=True,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            ["git", *arguments],
+            cwd=root,
+            shell=False,
+            capture_output=True,
+            check=False,
+        )
+    except OSError as error:
+        raise WorkspaceCaptureError("git_unavailable") from error
     if result.returncode != 0:
-        reason = os.fsdecode(result.stderr).strip() or "unknown Git error"
-        raise RuntimeError(f"cannot capture Git workspace: {reason}")
+        raise WorkspaceCaptureError("git_inspection_failed")
     return tuple(
         os.fsdecode(item).replace("\\", "/")
         for item in result.stdout.split(b"\0")
         if item
     )
+
+
+def _has_git_marker(root: Path) -> bool:
+    marker = root / ".git"
+    return marker.is_dir() or marker.is_file()
 
 
 def _non_git_paths(root: Path) -> tuple[str, ...]:

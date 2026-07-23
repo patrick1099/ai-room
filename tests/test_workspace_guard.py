@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+import ai_room.workspace_guard as workspace_guard
 from ai_room.domain import (
     AgentName,
     ContextSample,
@@ -192,6 +193,78 @@ def test_non_git_directory_hashes_regular_files(
 
     assert "runtime/ai-room/room.sqlite3" not in paths
     assert result.violations == ("文档.txt",)
+
+
+@pytest.mark.parametrize(
+    ("marker_kind", "git_failure", "expected_reason"),
+    [
+        ("directory", "missing", "git_unavailable"),
+        ("file", "failed", "git_inspection_failed"),
+    ],
+)
+def test_git_marker_fails_closed_when_git_inspection_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    marker_kind: str,
+    git_failure: str,
+    expected_reason: str,
+) -> None:
+    root = tmp_path / f"git-{marker_kind}-{git_failure}"
+    root.mkdir()
+    marker = root / ".git"
+    if marker_kind == "directory":
+        marker.mkdir()
+        (marker / "config").write_text("internal", encoding="utf-8")
+    else:
+        marker.write_text("gitdir: ../worktrees/example\n", encoding="utf-8")
+    (root / "ignored.log").write_text("must not be walked", encoding="utf-8")
+
+    if git_failure == "missing":
+
+        def fail_git(*args, **kwargs):
+            raise FileNotFoundError("git")
+
+        monkeypatch.setattr(workspace_guard.subprocess, "run", fail_git)
+    else:
+        monkeypatch.setattr(
+            workspace_guard.subprocess,
+            "run",
+            lambda *args, **kwargs: subprocess.CompletedProcess(
+                args[0],
+                128,
+                stdout=b"",
+                stderr=b"fatal: inspection failed",
+            ),
+        )
+
+    with pytest.raises(RuntimeError) as caught:
+        capture_workspace(root)
+
+    assert type(caught.value).__name__ == "WorkspaceCaptureError"
+    assert caught.value.reason == expected_reason
+
+
+def test_true_non_git_directory_still_uses_recursive_capture_when_git_rejects_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "not-a-repository"
+    root.mkdir()
+    (root / "文档.txt").write_text("content", encoding="utf-8")
+    monkeypatch.setattr(
+        workspace_guard.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0],
+            128,
+            stdout=b"",
+            stderr=b"fatal: not a git repository",
+        ),
+    )
+
+    snapshot = capture_workspace(root)
+
+    assert {path for path, _ in snapshot.files} == {"文档.txt"}
 
 
 @pytest.fixture
