@@ -1,7 +1,7 @@
 # ai-room 双 AI 顾问房间设计
 
 日期：2026-07-23
-状态：已确认并完成自审，待用户书面复核
+状态：implemented, awaiting dual-window acceptance
 
 ## 1. 背景与目标
 
@@ -191,5 +191,7 @@ SQLite 开启 WAL，`busy_timeout` 固定为 5 秒。数据库只保存房间、
 
 ## 12. 完成标准
 
-第一版只有在自动测试通过，并由用户在真实 Claude Code/Codex 双窗口中完成第 10.2 节验收后，
-才可以宣称可用。仅有代码、单元测试或单边 CLI 演示不能算完成。
+自动实现和 subprocess 级恢复验证已经完成；真实双窗口验收尚未执行。第一版只有在自动测试
+通过，并由用户在真实 Claude Code/Codex 双窗口中完成第 10.2 节和
+`docs/acceptance/dual-window.md` 后，才可以把状态改为 `accepted` 并宣称可用。仅有代码、
+单元测试、subprocess 测试或单边 CLI 演示不能算真实验收完成。
