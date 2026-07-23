@@ -28,7 +28,7 @@ from .context.policy import PreviousContextCheck
 from .workspace_guard import WorkspaceSnapshot
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 1
 _ACTIVE_STATES = (TaskState.WORKING.value, TaskState.WAITING_CHECKPOINT.value)
 _TERMINAL_STATES = {
     TaskOutcome.DONE: TaskState.DONE,

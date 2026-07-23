@@ -124,6 +124,23 @@ def test_schema_contains_required_tables_and_indexes(store: SQLiteStore) -> None
     } <= names
 
 
+def test_new_database_keeps_v1_schema_with_context_check_state(
+    store: SQLiteStore,
+) -> None:
+    schema_version = store._connection.execute(
+        "SELECT schema_version FROM schema_meta WHERE singleton = 1"
+    ).fetchone()[0]
+    context_state = store._connection.execute(
+        """
+        SELECT 1 FROM sqlite_master
+        WHERE type = 'table' AND name = 'context_check_state'
+        """
+    ).fetchone()
+
+    assert schema_version == 1
+    assert context_state is not None
+
+
 def test_store_reopens_with_tasks_intact(
     tmp_path: Path,
     clock: FakeClock,
