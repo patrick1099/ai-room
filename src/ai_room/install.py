@@ -1,0 +1,400 @@
+"""结构: App installer over a small write Port with recording/filesystem Adapters.
+用途: Install identical ai-room guidance and one idempotent Claude hook.
+用法: python -m ai_room.install --check
+原始需求: Preview and apply one safe ordered install plan without replacing user configuration.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from enum import StrEnum
+from pathlib import Path
+from typing import Protocol, TextIO
+
+
+_HOOK_MODULE = "ai_room.hooks.claude_session_start"
+_HOOK_MATCHER = "startup|resume|clear|compact"
+
+
+class InstallError(RuntimeError):
+    """Base class for expected installer failures."""
+
+
+class InstallConflictError(InstallError):
+    """Raised when installation would overwrite or discard user configuration."""
+
+
+class PathState(StrEnum):
+    MISSING = "missing"
+    FILE = "file"
+    OTHER = "other"
+
+
+@dataclass(frozen=True)
+class InstallPlan:
+    skill_bytes: bytes
+    codex_skill: Path
+    claude_skill: Path
+    claude_settings: Path
+    settings_backup: Path
+    session_start_group: dict[str, object]
+
+
+@dataclass(frozen=True)
+class InstallOperation:
+    action: str
+    path: Path
+    sha256: str
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "action": self.action,
+            "path": str(self.path),
+            "sha256": self.sha256,
+        }
+
+
+@dataclass(frozen=True)
+class InstallReport:
+    operations: tuple[InstallOperation, ...]
+
+
+class InstallWriter(Protocol):
+    """Port for all filesystem observation and mutation used by installation."""
+
+    def state(self, path: Path) -> PathState:
+        ...
+
+    def read_bytes(self, path: Path) -> bytes:
+        ...
+
+    def atomic_write(self, path: Path, data: bytes) -> None:
+        ...
+
+
+class RecordingWriter:
+    """Read the current filesystem but record intended writes without changing it."""
+
+    def state(self, path: Path) -> PathState:
+        return _path_state(path)
+
+    def read_bytes(self, path: Path) -> bytes:
+        return path.read_bytes()
+
+    def atomic_write(self, path: Path, data: bytes) -> None:
+        del path, data
+
+
+class FilesystemWriter:
+    """Apply writes with a temporary sibling and one atomic replace."""
+
+    def state(self, path: Path) -> PathState:
+        return _path_state(path)
+
+    def read_bytes(self, path: Path) -> bytes:
+        return path.read_bytes()
+
+    def atomic_write(self, path: Path, data: bytes) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+        )
+        temporary = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(data)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temporary, path)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+
+
+@dataclass(frozen=True)
+class _PreparedWrite:
+    operation: InstallOperation
+    data: bytes | None
+
+
+def build_install_plan(
+    home: Path,
+    python_exe: Path,
+    source_skill: Path,
+) -> InstallPlan:
+    """Build immutable destinations, source bytes, hook, and backup identity."""
+    normalized_home = Path(home).expanduser()
+    normalized_python = Path(python_exe)
+    normalized_source = Path(source_skill)
+    if _path_state(normalized_source) is not PathState.FILE:
+        raise InstallConflictError(
+            f"source skill is not a regular file: {normalized_source}"
+        )
+
+    hook_command = subprocess.list2cmdline(
+        [str(normalized_python), "-m", _HOOK_MODULE]
+    )
+    session_start_group: dict[str, object] = {
+        "matcher": _HOOK_MATCHER,
+        "hooks": [{"type": "command", "command": hook_command}],
+    }
+    settings = normalized_home / ".claude" / "settings.json"
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    return InstallPlan(
+        skill_bytes=normalized_source.read_bytes(),
+        codex_skill=normalized_home / ".codex" / "skills" / "ai-room" / "SKILL.md",
+        claude_skill=normalized_home / ".claude" / "skills" / "ai-room" / "SKILL.md",
+        claude_settings=settings,
+        settings_backup=settings.with_name(f"{settings.name}.{timestamp}.bak"),
+        session_start_group=session_start_group,
+    )
+
+
+def execute_install(
+    plan: InstallPlan,
+    writer: InstallWriter,
+) -> InstallReport:
+    """Preflight the full plan, then execute its one ordered operation path."""
+    prepared = _prepare_install(plan, writer)
+    for item in prepared:
+        if item.data is not None:
+            writer.atomic_write(item.operation.path, item.data)
+    return InstallReport(tuple(item.operation for item in prepared))
+
+
+def _prepare_install(
+    plan: InstallPlan,
+    writer: InstallWriter,
+) -> tuple[_PreparedWrite, ...]:
+    destinations = (plan.codex_skill, plan.claude_skill, plan.claude_settings)
+    states = {path: writer.state(path) for path in destinations}
+    for path, state in states.items():
+        if state is PathState.OTHER:
+            raise InstallConflictError(
+                f"installation destination is not a regular file: {path}"
+            )
+
+    existing_settings: bytes | None = None
+    settings_changed = False
+    if states[plan.claude_settings] is PathState.FILE:
+        existing_settings = writer.read_bytes(plan.claude_settings)
+        settings_data, settings_changed = _merge_settings(
+            existing_settings, plan.session_start_group
+        )
+    else:
+        settings_data, settings_changed = _merge_settings(
+            None, plan.session_start_group
+        )
+
+    prepared: list[_PreparedWrite] = []
+    for path in (plan.codex_skill, plan.claude_skill):
+        prepared.append(_prepare_file(path, plan.skill_bytes, states[path], writer))
+
+    if existing_settings is not None and settings_changed:
+        backup_state = writer.state(plan.settings_backup)
+        if backup_state is not PathState.MISSING:
+            raise InstallConflictError(
+                f"settings backup destination already exists: "
+                f"{plan.settings_backup}"
+            )
+        prepared.append(_prepared("backup", plan.settings_backup, existing_settings))
+
+    if settings_changed:
+        prepared.append(_prepared("write", plan.claude_settings, settings_data))
+    else:
+        prepared.append(_prepared("unchanged", plan.claude_settings, None))
+    return tuple(prepared)
+
+
+def _prepare_file(
+    path: Path,
+    desired: bytes,
+    state: PathState,
+    writer: InstallWriter,
+) -> _PreparedWrite:
+    if state is PathState.FILE and writer.read_bytes(path) == desired:
+        return _prepared("unchanged", path, None, desired)
+    return _prepared("write", path, desired)
+
+
+def _prepared(
+    action: str,
+    path: Path,
+    data: bytes | None,
+    hash_data: bytes | None = None,
+) -> _PreparedWrite:
+    digest_source = hash_data if hash_data is not None else (data or b"")
+    return _PreparedWrite(
+        InstallOperation(
+            action=action,
+            path=path,
+            sha256=hashlib.sha256(digest_source).hexdigest(),
+        ),
+        data,
+    )
+
+
+def _merge_settings(
+    existing: bytes | None,
+    desired_group: dict[str, object],
+) -> tuple[bytes, bool]:
+    if existing is None:
+        settings: dict[str, object] = {}
+    else:
+        try:
+            parsed = json.loads(existing.decode("utf-8-sig"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise InstallConflictError(
+                "Claude settings must contain valid JSON"
+            ) from error
+        if not isinstance(parsed, dict):
+            raise InstallConflictError(
+                "Claude settings root must be a JSON object"
+            )
+        settings = parsed
+
+    hooks_value = settings.get("hooks")
+    if hooks_value is None:
+        hooks: dict[str, object] = {}
+        settings["hooks"] = hooks
+    elif isinstance(hooks_value, dict):
+        hooks = hooks_value
+    else:
+        raise InstallConflictError("Claude settings hooks must be a JSON object")
+
+    session_value = hooks.get("SessionStart")
+    if session_value is None:
+        session_groups: list[object] = []
+        hooks["SessionStart"] = session_groups
+    elif isinstance(session_value, list):
+        session_groups = session_value
+    else:
+        raise InstallConflictError(
+            "Claude SessionStart hooks must be a JSON array"
+        )
+
+    exact_groups = 0
+    for event, groups in hooks.items():
+        if not isinstance(groups, list):
+            continue
+        for group in groups:
+            commands = _hook_commands(group)
+            if not any(_HOOK_MODULE in command for command in commands):
+                continue
+            if event == "SessionStart" and group == desired_group:
+                exact_groups += 1
+                continue
+            raise InstallConflictError(
+                "conflicting ai-room hook command already exists"
+            )
+
+    if exact_groups > 1:
+        raise InstallConflictError("duplicate ai-room hook commands already exist")
+    if exact_groups == 1:
+        if existing is None:
+            raise AssertionError("new settings cannot already contain a hook")
+        return existing, False
+
+    session_groups.append(desired_group)
+    encoded = json.dumps(
+        settings, ensure_ascii=False, indent=2
+    ).encode("utf-8") + b"\n"
+    return encoded, True
+
+
+def _hook_commands(group: object) -> list[str]:
+    if not isinstance(group, dict):
+        return []
+    hooks = group.get("hooks")
+    if not isinstance(hooks, list):
+        return []
+    commands: list[str] = []
+    for hook in hooks:
+        if not isinstance(hook, dict):
+            continue
+        command = hook.get("command")
+        if isinstance(command, str):
+            commands.append(command)
+    return commands
+
+
+def _path_state(path: Path) -> PathState:
+    if path.is_symlink():
+        return PathState.OTHER
+    if path.is_file():
+        return PathState.FILE
+    if path.exists():
+        return PathState.OTHER
+    return PathState.MISSING
+
+
+def _default_source_skill() -> Path:
+    return Path(__file__).resolve().parents[2] / "integrations" / "ai-room" / "SKILL.md"
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m ai_room.install",
+        description="Preview or apply the ai-room user integration.",
+    )
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--check", action="store_true", help="preview without writes")
+    mode.add_argument("--apply", action="store_true", help="apply atomic writes")
+    return parser
+
+
+def main(
+    argv: Sequence[str] | None = None,
+    *,
+    home: Path | None = None,
+    python_exe: Path | None = None,
+    source_skill: Path | None = None,
+    stdout: TextIO | None = None,
+    stderr: TextIO | None = None,
+) -> int:
+    """Run isolated preview or explicitly requested apply mode."""
+    output = stdout or sys.stdout
+    error_output = stderr or sys.stderr
+    arguments = _build_parser().parse_args(argv)
+    mode = "check" if arguments.check else "apply"
+    try:
+        plan = build_install_plan(
+            home or Path.home(),
+            python_exe or Path(sys.executable),
+            source_skill or _default_source_skill(),
+        )
+        writer: InstallWriter
+        writer = RecordingWriter() if arguments.check else FilesystemWriter()
+        report = execute_install(plan, writer)
+    except InstallError as error:
+        print(f"ai-room install refused: {error}", file=error_output)
+        return 1
+
+    json.dump(
+        {
+            "mode": mode,
+            "operations": [
+                operation.as_dict() for operation in report.operations
+            ],
+        },
+        output,
+        ensure_ascii=False,
+        indent=2,
+    )
+    output.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
