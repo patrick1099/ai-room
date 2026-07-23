@@ -1,0 +1,2 @@
+{"timestamp":"2026-07-23T01:00:00Z","type":"session_meta","session_id":"other-thread","payload":{"id":"thread-123","session_id":"thread-123","cwd":"C:\\工作区\\ai room"}}
+{"timestamp":"2026-07-23T01:03:00Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":156000},"model_context_window":258400}}}

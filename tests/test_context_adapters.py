@@ -118,6 +118,43 @@ def test_codex_rejects_mismatched_transcript_identity(
     assert "identity" in (sample.unknown_reason or "").lower()
 
 
+def test_codex_rejects_contradictory_record_identities(
+    fixture_dir: Path,
+) -> None:
+    sample = parse_codex_transcript(
+        fixture_dir / "codex_session_contradictory.jsonl",
+        "thread-123",
+    )
+
+    assert sample.input_tokens is None
+    assert "contradictory" in (sample.unknown_reason or "").lower()
+
+
+def test_codex_discovery_rejects_contradictory_record_identities(
+    tmp_path: Path,
+    fixture_dir: Path,
+) -> None:
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    (sessions / "contradictory.jsonl").write_text(
+        (
+            fixture_dir / "codex_session_contradictory.jsonl"
+        ).read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    adapter = CodexContextAdapter(
+        environ={
+            "CODEX_THREAD_ID": "thread-123",
+            "CODEX_HOME": str(tmp_path),
+        }
+    )
+
+    sample = adapter.sample()
+
+    assert sample.input_tokens is None
+    assert "contradictory" in (sample.unknown_reason or "").lower()
+
+
 def test_claude_uses_latest_assistant_event_even_when_it_drifted(
     tmp_path: Path,
 ) -> None:

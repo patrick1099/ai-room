@@ -12,6 +12,10 @@ from ai_room.domain import ContextSample, ContextSource
 from .base import ContextAdapter, unknown_sample
 
 
+class _ContradictoryIdentityError(ValueError):
+    """One Codex record carries incompatible recognized session identities."""
+
+
 class CodexContextAdapter(ContextAdapter):
     """Discover and sample the transcript identified by ``CODEX_THREAD_ID``."""
 
@@ -44,10 +48,17 @@ class CodexContextAdapter(ContextAdapter):
         try:
             transcripts = sessions_root.rglob("*.jsonl")
             for transcript in transcripts:
-                identified = _transcript_identifies_thread(
-                    transcript,
-                    session_id,
-                )
+                try:
+                    identified = _transcript_identifies_thread(
+                        transcript,
+                        session_id,
+                    )
+                except _ContradictoryIdentityError:
+                    return unknown_sample(
+                        session_id,
+                        "Codex format drift: contradictory identities in "
+                        f"transcript {transcript}",
+                    )
                 if identified is None:
                     unreadable += 1
                 elif identified:
@@ -99,6 +110,12 @@ def parse_codex_transcript(
                     continue
 
                 identities = _codex_record_identities(record)
+                if len(identities) > 1:
+                    return unknown_sample(
+                        session_id,
+                        "Codex format drift: contradictory identities in "
+                        "one transcript record",
+                    )
                 if identities:
                     saw_identity = True
                     if _is_session_meta(record) and session_id not in identities:
@@ -164,6 +181,8 @@ def _transcript_identifies_thread(
                     continue
                 identities = _codex_record_identities(record)
                 if identities:
+                    if len(identities) > 1:
+                        raise _ContradictoryIdentityError
                     return session_id in identities
     except (OSError, UnicodeError):
         return None
