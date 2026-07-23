@@ -42,6 +42,12 @@ class ContextSource(StrEnum):
     CLAUDE_USAGE = "claude_usage"
 
 
+class MemberStatus(StrEnum):
+    NEVER_JOINED = "never_joined"
+    JOINED_NOT_WAITING = "joined_not_waiting"
+    WAITING = "waiting"
+
+
 @dataclass(frozen=True)
 class RoomRef:
     room_id: str
@@ -110,3 +116,11 @@ class MemberView:
     is_joined: bool
     is_waiting: bool
     last_heartbeat: float | None
+
+    @property
+    def status(self) -> MemberStatus:
+        if self.is_waiting:
+            return MemberStatus.WAITING
+        if self.is_joined or self.last_heartbeat is not None:
+            return MemberStatus.JOINED_NOT_WAITING
+        return MemberStatus.NEVER_JOINED

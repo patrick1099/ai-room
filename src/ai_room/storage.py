@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -100,10 +101,13 @@ CREATE TABLE rooms (
 CREATE TABLE members (
     room_id TEXT NOT NULL REFERENCES rooms(room_id),
     agent TEXT NOT NULL,
+    session_id TEXT,
     joined_at REAL NOT NULL,
     left_at REAL,
     last_heartbeat REAL NOT NULL,
     is_waiting INTEGER NOT NULL CHECK (is_waiting IN (0, 1)),
+    waiter_pid INTEGER,
+    waiter_token TEXT,
     PRIMARY KEY (room_id, agent)
 );
 
@@ -156,6 +160,8 @@ CREATE TABLE messages (
     delivered_at REAL,
     lease_token TEXT,
     lease_expires_at REAL,
+    delivered_session_id TEXT,
+    delivered_pid INTEGER,
     acknowledged_at REAL,
     created_at REAL NOT NULL,
     UNIQUE (room_id, idempotency_key),
@@ -296,6 +302,7 @@ class SQLiteStore:
         self._connection = connection
         self._path = path
         self._clock = clock
+        self._mutation_lock = threading.RLock()
 
     @classmethod
     def open(cls, path: Path, clock: Callable[[], float]) -> SQLiteStore:
@@ -305,7 +312,12 @@ class SQLiteStore:
         try:
             if is_new:
                 path.parent.mkdir(parents=True, exist_ok=True)
-            connection = sqlite3.connect(path, timeout=5.0, isolation_level=None)
+            connection = sqlite3.connect(
+                path,
+                timeout=5.0,
+                isolation_level=None,
+                check_same_thread=False,
+            )
             connection.row_factory = sqlite3.Row
 
             if not is_new:
@@ -356,21 +368,30 @@ class SQLiteStore:
 
     @contextmanager
     def _mutation(self) -> Iterator[None]:
-        try:
-            self._connection.execute("BEGIN IMMEDIATE")
-        except sqlite3.OperationalError as error:
-            if _is_busy(error):
-                raise DatabaseBusyError("database remained busy for 5000 ms") from error
-            raise
-        try:
-            yield
-        except Exception:
-            self._connection.rollback()
-            raise
-        else:
-            self._connection.commit()
+        with self._mutation_lock:
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as error:
+                if _is_busy(error):
+                    raise DatabaseBusyError(
+                        "database remained busy for 5000 ms"
+                    ) from error
+                raise
+            try:
+                yield
+            except Exception:
+                self._connection.rollback()
+                raise
+            else:
+                self._connection.commit()
 
-    def join_member(self, room: RoomRef, agent: AgentName) -> MemberView:
+    def join_member(
+        self,
+        room: RoomRef,
+        agent: AgentName,
+        *,
+        session_id: str | None = None,
+    ) -> MemberView:
         now = self._clock()
         try:
             with self._mutation():
@@ -396,15 +417,19 @@ class SQLiteStore:
                 self._connection.execute(
                     """
                     INSERT INTO members (
-                        room_id, agent, joined_at, left_at, last_heartbeat, is_waiting
-                    ) VALUES (?, ?, ?, NULL, ?, 0)
+                        room_id, agent, session_id, joined_at, left_at,
+                        last_heartbeat, is_waiting, waiter_pid, waiter_token
+                    ) VALUES (?, ?, ?, ?, NULL, ?, 0, NULL, NULL)
                     ON CONFLICT(room_id, agent) DO UPDATE SET
+                        session_id = excluded.session_id,
                         joined_at = excluded.joined_at,
                         left_at = NULL,
                         last_heartbeat = excluded.last_heartbeat,
-                        is_waiting = 0
+                        is_waiting = 0,
+                        waiter_pid = NULL,
+                        waiter_token = NULL
                     """,
-                    (room.room_id, agent.value, now, now),
+                    (room.room_id, agent.value, session_id, now, now),
                 )
         except sqlite3.OperationalError as error:
             if _is_busy(error):
@@ -412,17 +437,35 @@ class SQLiteStore:
             raise
         return MemberView(agent, True, False, now)
 
-    def leave_member(self, room_id: str, agent: AgentName) -> None:
+    def leave_member(
+        self,
+        room_id: str,
+        agent: AgentName,
+        *,
+        session_id: str | None = None,
+    ) -> None:
         now = self._clock()
         with self._mutation():
-            self._connection.execute(
-                """
-                UPDATE members
-                SET left_at = ?, last_heartbeat = ?, is_waiting = 0
-                WHERE room_id = ? AND agent = ?
-                """,
-                (now, now, room_id, agent.value),
-            )
+            if session_id is None:
+                self._connection.execute(
+                    """
+                    UPDATE members
+                    SET left_at = ?, last_heartbeat = ?, is_waiting = 0,
+                        waiter_pid = NULL, waiter_token = NULL
+                    WHERE room_id = ? AND agent = ?
+                    """,
+                    (now, now, room_id, agent.value),
+                )
+            else:
+                self._connection.execute(
+                    """
+                    UPDATE members
+                    SET left_at = ?, last_heartbeat = ?, is_waiting = 0,
+                        waiter_pid = NULL, waiter_token = NULL
+                    WHERE room_id = ? AND agent = ? AND session_id = ?
+                    """,
+                    (now, now, room_id, agent.value, session_id),
+                )
 
     def heartbeat(
         self, room_id: str, agent: AgentName, *, is_waiting: bool
@@ -442,6 +485,135 @@ class SQLiteStore:
                     f"{agent.value} is not joined to room {room_id!r}"
                 )
         return MemberView(agent, True, is_waiting, now)
+
+    def begin_wait(
+        self,
+        room_id: str,
+        agent: AgentName,
+        *,
+        session_id: str,
+        waiter_pid: int,
+        waiter_token: str,
+    ) -> MemberView:
+        now = self._clock()
+        with self._mutation():
+            cursor = self._connection.execute(
+                """
+                UPDATE members
+                SET last_heartbeat = ?, is_waiting = 1,
+                    waiter_pid = ?, waiter_token = ?
+                WHERE room_id = ? AND agent = ? AND session_id = ?
+                  AND left_at IS NULL
+                """,
+                (
+                    now,
+                    waiter_pid,
+                    waiter_token,
+                    room_id,
+                    agent.value,
+                    session_id,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise PeerNotJoinedError(
+                    f"{agent.value} session is not joined to room {room_id!r}"
+                )
+        return MemberView(agent, True, True, now)
+
+    def refresh_waiter(
+        self,
+        room_id: str,
+        agent: AgentName,
+        *,
+        session_id: str,
+        waiter_pid: int,
+        waiter_token: str,
+    ) -> bool:
+        now = self._clock()
+        with self._mutation():
+            cursor = self._connection.execute(
+                """
+                UPDATE members
+                SET last_heartbeat = ?
+                WHERE room_id = ? AND agent = ? AND session_id = ?
+                  AND left_at IS NULL AND is_waiting = 1
+                  AND waiter_pid = ? AND waiter_token = ?
+                """,
+                (
+                    now,
+                    room_id,
+                    agent.value,
+                    session_id,
+                    waiter_pid,
+                    waiter_token,
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def clear_waiter(
+        self,
+        room_id: str,
+        agent: AgentName,
+        *,
+        session_id: str,
+        waiter_pid: int,
+        waiter_token: str,
+    ) -> bool:
+        now = self._clock()
+        with self._mutation():
+            cursor = self._connection.execute(
+                """
+                UPDATE members
+                SET last_heartbeat = ?, is_waiting = 0,
+                    waiter_pid = NULL, waiter_token = NULL
+                WHERE room_id = ? AND agent = ? AND session_id = ?
+                  AND waiter_pid = ? AND waiter_token = ?
+                """,
+                (
+                    now,
+                    room_id,
+                    agent.value,
+                    session_id,
+                    waiter_pid,
+                    waiter_token,
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def acknowledge_informational_replies(
+        self,
+        room_id: str,
+        recipient: AgentName,
+        *,
+        session_id: str,
+    ) -> int:
+        now = self._clock()
+        with self._mutation():
+            member = self._connection.execute(
+                """
+                SELECT 1 FROM members
+                WHERE room_id = ? AND agent = ? AND session_id = ?
+                  AND left_at IS NULL
+                """,
+                (room_id, recipient.value, session_id),
+            ).fetchone()
+            if member is None:
+                raise PeerNotJoinedError(
+                    f"{recipient.value} session is not joined to room {room_id!r}"
+                )
+            cursor = self._connection.execute(
+                """
+                UPDATE messages
+                SET acknowledged_at = ?
+                WHERE room_id = ? AND recipient = ?
+                  AND message_type = 'reply'
+                  AND acknowledged_at IS NULL
+                  AND delivered_session_id = ?
+                  AND lease_expires_at > ?
+                """,
+                (now, room_id, recipient.value, session_id, now),
+            )
+        return cursor.rowcount
 
     def enqueue_task(self, request: TaskRequest) -> TaskView:
         now = self._clock()
@@ -465,7 +637,7 @@ class SQLiteStore:
                 peer = self._connection.execute(
                     """
                     SELECT 1 FROM members
-                    WHERE room_id = ? AND agent = ? AND left_at IS NULL
+                    WHERE room_id = ? AND agent = ?
                     """,
                     (request.room_id, request.recipient.value),
                 ).fetchone()
@@ -653,7 +825,13 @@ class SQLiteStore:
         )
 
     def claim_next_message(
-        self, room_id: str, recipient: AgentName, *, lease_seconds: float
+        self,
+        room_id: str,
+        recipient: AgentName,
+        *,
+        lease_seconds: float,
+        session_id: str | None = None,
+        waiter_pid: int | None = None,
     ) -> Delivery | None:
         now = self._clock()
         malformed: tuple[str, str] | None = None
@@ -695,10 +873,18 @@ class SQLiteStore:
                     self._connection.execute(
                         """
                         UPDATE messages
-                        SET delivered_at = ?, lease_token = ?, lease_expires_at = ?
+                        SET delivered_at = ?, lease_token = ?, lease_expires_at = ?,
+                            delivered_session_id = ?, delivered_pid = ?
                         WHERE message_id = ?
                         """,
-                        (now, lease_token, now + lease_seconds, row["message_id"]),
+                        (
+                            now,
+                            lease_token,
+                            now + lease_seconds,
+                            session_id,
+                            waiter_pid,
+                            row["message_id"],
+                        ),
                     )
                     delivery = Delivery(
                         message_id=row["message_id"],
