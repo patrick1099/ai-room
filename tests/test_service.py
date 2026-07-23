@@ -384,6 +384,109 @@ def test_old_wait_finally_cannot_clear_new_waiter(
     assert second_results == [None]
 
 
+def test_superseded_waiter_cannot_claim_new_request(
+    service_pair,
+    task_request: TaskRequest,
+    fake_clock: FakeClock,
+    room: RoomRef,
+) -> None:
+    primary, advisor = service_pair
+    advisor._waiter_token_factory = lambda: "older-token"
+    current_advisor = AiRoomService(
+        advisor._store,
+        room,
+        AgentName.CLAUDE,
+        session_id="claude-session",
+        clock=fake_clock,
+        poll_seconds=0.01,
+        heartbeat_seconds=5.0,
+        stale_seconds=15.0,
+        process_id=303,
+        waiter_token_factory=lambda: "current-token",
+    )
+
+    class PollGate:
+        def __init__(self) -> None:
+            self._cancelled = threading.Event()
+            self._permits = threading.Semaphore(0)
+            self._condition = threading.Condition()
+            self.calls = 0
+
+        def is_set(self) -> bool:
+            return self._cancelled.is_set()
+
+        def wait(self, timeout: float) -> bool:
+            with self._condition:
+                self.calls += 1
+                self._condition.notify_all()
+            self._permits.acquire(timeout=2)
+            return self.is_set()
+
+        def wait_until_parked(self, calls: int) -> None:
+            deadline = time.monotonic() + 2
+            with self._condition:
+                while self.calls < calls:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        pytest.fail("waiter did not reach the expected poll")
+                    self._condition.wait(timeout=remaining)
+
+        def release(self) -> None:
+            self._permits.release()
+
+        def cancel(self) -> None:
+            self._cancelled.set()
+            self._permits.release()
+
+    old_gate = PollGate()
+    current_gate = PollGate()
+    old_thread, old_results = _wait_in_thread(advisor, old_gate)
+    old_gate.wait_until_parked(1)
+    current_thread, current_results = _wait_in_thread(
+        current_advisor,
+        current_gate,
+    )
+    current_gate.wait_until_parked(1)
+
+    try:
+        sent = primary.send(task_request)
+        old_gate.release()
+        old_gate.wait_until_parked(2)
+        member_row = primary._store._connection.execute(
+            """
+            SELECT waiter_pid, waiter_token, is_waiting
+            FROM members
+            WHERE room_id = ? AND agent = ?
+            """,
+            (room.room_id, AgentName.CLAUDE.value),
+        ).fetchone()
+        assert tuple(member_row) == (303, "current-token", 1)
+
+        current_gate.release()
+        _wait_until(lambda: len(current_results) == 1)
+        fake_clock.advance(5.0)
+        old_gate.release()
+        _wait_until(lambda: len(old_results) == 1)
+
+        assert old_results == [None]
+        delivery = current_results[0]
+        assert delivery.task_id == sent.task_id
+        delivery_row = primary._store._connection.execute(
+            """
+            SELECT delivered_session_id, delivered_pid
+            FROM messages
+            WHERE message_id = ?
+            """,
+            (delivery.message_id,),
+        ).fetchone()
+        assert tuple(delivery_row) == ("claude-session", 303)
+    finally:
+        old_gate.cancel()
+        current_gate.cancel()
+        old_thread.join(timeout=2)
+        current_thread.join(timeout=2)
+
+
 def test_keyboard_interrupt_propagates_and_clears_only_wait_state(
     service_pair,
 ) -> None:

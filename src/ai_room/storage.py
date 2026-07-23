@@ -379,7 +379,7 @@ class SQLiteStore:
                 raise
             try:
                 yield
-            except Exception:
+            except BaseException:
                 self._connection.rollback()
                 raise
             else:
@@ -832,12 +832,42 @@ class SQLiteStore:
         lease_seconds: float,
         session_id: str | None = None,
         waiter_pid: int | None = None,
+        waiter_token: str | None = None,
     ) -> Delivery | None:
+        waiter_identity = (session_id, waiter_pid, waiter_token)
+        has_waiter_identity = any(value is not None for value in waiter_identity)
+        if has_waiter_identity and not all(
+            value is not None for value in waiter_identity
+        ):
+            raise ValueError(
+                "session_id, waiter_pid, and waiter_token must form "
+                "a complete waiter identity"
+            )
+
         now = self._clock()
         malformed: tuple[str, str] | None = None
         delivery: Delivery | None = None
         try:
             with self._mutation():
+                if has_waiter_identity:
+                    current_waiter = self._connection.execute(
+                        """
+                        SELECT 1 FROM members
+                        WHERE room_id = ? AND agent = ? AND session_id = ?
+                          AND left_at IS NULL AND is_waiting = 1
+                          AND waiter_pid = ? AND waiter_token = ?
+                        """,
+                        (
+                            room_id,
+                            recipient.value,
+                            session_id,
+                            waiter_pid,
+                            waiter_token,
+                        ),
+                    ).fetchone()
+                    if current_waiter is None:
+                        return None
+
                 row = self._connection.execute(
                     """
                     SELECT * FROM messages

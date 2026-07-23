@@ -120,6 +120,7 @@ class AiRoomService:
                     lease_seconds=self._stale_seconds,
                     session_id=self._session_id,
                     waiter_pid=self._process_id,
+                    waiter_token=waiter_token,
                 )
                 if delivery is not None:
                     return delivery

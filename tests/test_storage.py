@@ -282,6 +282,34 @@ def test_real_write_lock_maps_to_database_busy_error(
         store.close()
 
 
+def test_mutation_rolls_back_keyboard_interrupt_without_masking_it(
+    store: SQLiteStore,
+    room: RoomRef,
+) -> None:
+    interrupt = KeyboardInterrupt("stop-now")
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        with store._mutation():
+            store._connection.execute(
+                """
+                INSERT INTO rooms (room_id, root, explicit_name, created_at)
+                VALUES (?, ?, NULL, ?)
+                """,
+                ("interrupted-room", "interrupted-root", 1_000.0),
+            )
+            raise interrupt
+
+    assert caught.value is interrupt
+    assert store._connection.in_transaction is False
+    assert store._connection.execute(
+        "SELECT 1 FROM rooms WHERE room_id = ?",
+        ("interrupted-room",),
+    ).fetchone() is None
+
+    joined = store.join_member(room, AgentName.CODEX)
+    assert joined.is_joined is True
+
+
 def test_rooms_keep_members_and_tasks_distinct(
     store: SQLiteStore,
     tmp_path: Path,
@@ -462,6 +490,22 @@ def test_unacknowledged_delivery_is_redelivered_only_after_lease_expiry(
     assert second is not None
     assert second.message_id == first.message_id
     assert second.lease_token != first.lease_token
+
+
+def test_claim_rejects_partial_waiter_identity(
+    joined_store: SQLiteStore,
+    task_request: TaskRequest,
+) -> None:
+    task = joined_store.enqueue_task(task_request)
+
+    with pytest.raises(ValueError, match="waiter identity"):
+        joined_store.claim_next_message(
+            task.room_id,
+            AgentName.CLAUDE,
+            lease_seconds=60,
+            session_id="claude-session",
+            waiter_pid=202,
+        )
 
 
 def test_reply_is_idempotent(
