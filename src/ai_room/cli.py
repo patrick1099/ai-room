@@ -229,7 +229,7 @@ def main(
         root_key = normalize_root(root)
 
         if arguments.command == "join":
-            explicit_name = arguments.room or None
+            explicit_name = arguments.room
             registry.reserve_binding(
                 root_key,
                 requested_agent,

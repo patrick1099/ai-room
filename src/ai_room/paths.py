@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import subprocess
+import unicodedata
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
@@ -20,6 +21,7 @@ def resolve_room(
     git_toplevel: GitTopLevelResolver | None = None,
 ) -> RoomRef:
     """Build a deterministic room reference for one Git worktree or directory."""
+    validate_explicit_room_name(explicit_name)
     resolved_cwd = cwd.resolve()
     resolver = git_toplevel or _git_toplevel
     root = resolver(resolved_cwd) or resolved_cwd
@@ -62,3 +64,18 @@ def normalize_root(root: Path) -> str:
     if os.name == "nt":
         return normalized.casefold()
     return normalized
+
+
+def validate_explicit_room_name(explicit_name: str | None) -> None:
+    """Reject names that cannot be entered as a distinct explicit room."""
+    if explicit_name is None:
+        return
+    if not isinstance(explicit_name, str) or not explicit_name:
+        raise ValueError("room name must not be empty")
+    if explicit_name != explicit_name.strip():
+        raise ValueError("room name must not have surrounding whitespace")
+    if any(
+        unicodedata.category(character).startswith("C")
+        for character in explicit_name
+    ):
+        raise ValueError("room name must not contain control characters")

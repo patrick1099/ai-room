@@ -687,6 +687,103 @@ def test_invalid_persisted_binding_state_is_operational_json(
     assert error["code"] == "binding_database_open_failed"
 
 
+def test_unexpected_binding_trigger_is_operational_json_without_write(
+    cli_workspace,
+) -> None:
+    import sqlite3
+
+    workspace, local_app_data, codex_env, _ = cli_workspace
+    assert _run_cli(workspace, codex_env, "join", "codex").returncode == 0
+    registry = local_app_data / "ai-room" / "bindings" / "index.sqlite3"
+    connection = sqlite3.connect(registry)
+    before = connection.execute(
+        "SELECT COUNT(*) FROM room_bindings"
+    ).fetchone()[0]
+    connection.execute(
+        """
+        CREATE TRIGGER reject_binding_update
+        BEFORE UPDATE ON room_bindings
+        BEGIN
+            SELECT RAISE(ABORT, 'unexpected trigger executed');
+        END
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    status = _run_cli(workspace, codex_env, "status")
+
+    assert status.returncode == 3
+    error = _assert_one_json_object(status.stderr)["error"]
+    assert error["code"] == "binding_database_open_failed"
+    check = sqlite3.connect(registry)
+    try:
+        assert check.execute(
+            "SELECT COUNT(*) FROM room_bindings"
+        ).fetchone()[0] == before
+    finally:
+        check.close()
+
+
+def test_invalid_persisted_room_name_is_operational_json(
+    cli_workspace,
+) -> None:
+    import sqlite3
+
+    workspace, local_app_data, codex_env, _ = cli_workspace
+    joined = _run_cli(
+        workspace,
+        codex_env,
+        "join",
+        "codex",
+        "--room",
+        "valid-room",
+    )
+    assert joined.returncode == 0
+    registry = local_app_data / "ai-room" / "bindings" / "index.sqlite3"
+    connection = sqlite3.connect(registry)
+    connection.execute(
+        "UPDATE room_bindings SET explicit_name = '' WHERE agent = 'codex'"
+    )
+    connection.commit()
+    connection.close()
+
+    status = _run_cli(workspace, codex_env, "status")
+
+    assert status.returncode == 3
+    error = _assert_one_json_object(status.stderr)["error"]
+    assert error["code"] == "binding_database_open_failed"
+
+
+@pytest.mark.parametrize(
+    "room_name",
+    ("", " ", " padded", "padded ", "line\nbreak", "zero\u200bwidth"),
+)
+def test_join_rejects_invalid_room_name_without_reserving_binding(
+    cli_workspace,
+    room_name: str,
+) -> None:
+    workspace, _, codex_env, _ = cli_workspace
+
+    joined = _run_cli(
+        workspace,
+        codex_env,
+        "join",
+        "codex",
+        "--room",
+        room_name,
+    )
+
+    assert joined.returncode == 2
+    error = _assert_one_json_object(joined.stderr)["error"]
+    assert error["code"] == "argument_error"
+    status = _run_cli(workspace, codex_env, "status")
+    assert status.returncode == 3
+    assert _assert_one_json_object(status.stderr)["error"]["code"] == (
+        "room_binding_missing"
+    )
+
+
 def test_guard_violation_is_json_and_exit_four(cli_workspace) -> None:
     workspace, _, codex_env, claude_env = cli_workspace
     assert _run_cli(workspace, codex_env, "join", "codex").returncode == 0

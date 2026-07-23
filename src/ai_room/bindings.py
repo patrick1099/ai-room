@@ -12,6 +12,7 @@ from math import isfinite
 from pathlib import Path
 
 from .domain import AgentName
+from .paths import validate_explicit_room_name
 
 
 BINDING_SCHEMA_VERSION = 1
@@ -216,20 +217,25 @@ class BindingRegistry:
                 "binding registry schema metadata is invalid"
             )
 
-        table_rows = connection.execute(
+        schema_rows = connection.execute(
             """
-            SELECT name, sql
+            SELECT type, name, sql
             FROM sqlite_schema
-            WHERE type = 'table' AND name IN ('schema_meta', 'room_bindings')
+            WHERE name NOT LIKE 'sqlite_%'
             """
         ).fetchall()
-        table_sql = {row["name"]: row["sql"] for row in table_rows}
-        if set(table_sql) != set(_EXPECTED_TABLE_SQL):
+        schema_objects = {
+            (row["type"], row["name"]): row["sql"] for row in schema_rows
+        }
+        expected_objects = {
+            ("table", table_name) for table_name in _EXPECTED_TABLE_SQL
+        }
+        if set(schema_objects) != expected_objects:
             raise BindingDatabaseOpenError(
-                "binding registry schema is incomplete"
+                "binding registry contains unexpected schema objects"
             )
         for table_name, expected_sql in _EXPECTED_TABLE_SQL.items():
-            actual_sql = table_sql[table_name]
+            actual_sql = schema_objects[("table", table_name)]
             if (
                 not isinstance(actual_sql, str)
                 or _normalize_schema_sql(actual_sql)
@@ -247,19 +253,20 @@ class BindingRegistry:
         with self._mutation_lock:
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
-            except sqlite3.OperationalError as error:
-                if _is_busy(error):
-                    raise BindingDatabaseBusyError(
-                        "binding registry remained busy for 5000 ms"
-                    ) from error
-                raise
+            except sqlite3.Error as error:
+                _raise_binding_sqlite_error(error)
             try:
                 yield
-            except BaseException:
-                self._connection.rollback()
-                raise
-            else:
                 self._connection.commit()
+            except BaseException as error:
+                if self._connection.in_transaction:
+                    try:
+                        self._connection.rollback()
+                    except sqlite3.Error:
+                        pass
+                if isinstance(error, sqlite3.Error):
+                    _raise_binding_sqlite_error(error)
+                raise
 
     def reserve_binding(
         self,
@@ -269,6 +276,7 @@ class BindingRegistry:
         explicit_name: str | None,
     ) -> RoomBinding:
         _validate_key(root_key, session_id)
+        validate_explicit_room_name(explicit_name)
         now = self._clock()
         with self._mutation():
             existing = self._select(root_key, agent, session_id)
@@ -306,6 +314,7 @@ class BindingRegistry:
         explicit_name: str | None,
     ) -> RoomBinding:
         _validate_key(root_key, session_id)
+        validate_explicit_room_name(explicit_name)
         now = self._clock()
         with self._mutation():
             row = self._select(root_key, agent, session_id)
@@ -392,14 +401,17 @@ class BindingRegistry:
         agent: AgentName,
         session_id: str,
     ) -> sqlite3.Row | None:
-        return self._connection.execute(
-            """
-            SELECT root_key, agent, session_id, explicit_name, state, updated_at
-            FROM room_bindings
-            WHERE root_key = ? AND agent = ? AND session_id = ?
-            """,
-            (root_key, agent.value, session_id),
-        ).fetchone()
+        try:
+            return self._connection.execute(
+                """
+                SELECT root_key, agent, session_id, explicit_name, state, updated_at
+                FROM room_bindings
+                WHERE root_key = ? AND agent = ? AND session_id = ?
+                """,
+                (root_key, agent.value, session_id),
+            ).fetchone()
+        except sqlite3.Error as error:
+            _raise_binding_sqlite_error(error)
 
 
 def binding_registry_path(runtime_directory: Path) -> Path:
@@ -425,6 +437,7 @@ def _binding_from_row(row: sqlite3.Row | None) -> RoomBinding:
             raise TypeError("invalid session ID")
         if explicit_name is not None and not isinstance(explicit_name, str):
             raise TypeError("invalid room name")
+        validate_explicit_room_name(explicit_name)
         if not isinstance(state, str):
             raise TypeError("invalid binding state")
         if (
@@ -454,9 +467,20 @@ def _validate_key(root_key: str, session_id: str) -> None:
         raise ValueError("session_id must not be empty")
 
 
-def _is_busy(error: sqlite3.OperationalError) -> bool:
+def _is_busy(error: sqlite3.Error) -> bool:
     message = str(error).lower()
     return "locked" in message or "busy" in message
+
+
+def _raise_binding_sqlite_error(error: sqlite3.Error) -> None:
+    if _is_busy(error):
+        raise BindingDatabaseBusyError(
+            "binding registry remained busy for 5000 ms"
+        ) from error
+    raise BindingDatabaseOpenError(
+        "binding registry operation failed: "
+        f"{type(error).__name__}"
+    ) from error
 
 
 def _normalize_schema_sql(sql: str) -> str:

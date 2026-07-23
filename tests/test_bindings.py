@@ -373,6 +373,85 @@ def test_v1_registry_rejects_weakened_schema_constraints(
         bindings.BindingRegistry.open(path, clock)
 
 
+def test_v1_registry_rejects_unexpected_trigger_without_writing(
+    tmp_path: Path,
+    clock: FakeClock,
+) -> None:
+    bindings = _bindings()
+    path = tmp_path / "bindings" / "index.sqlite3"
+    created = bindings.BindingRegistry.open(path, clock)
+    created.close()
+    connection = sqlite3.connect(path)
+    connection.execute(
+        """
+        CREATE TRIGGER reject_binding_insert
+        BEFORE INSERT ON room_bindings
+        BEGIN
+            SELECT RAISE(ABORT, 'unexpected trigger executed');
+        END
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(bindings.BindingDatabaseOpenError):
+        bindings.BindingRegistry.open(path, clock)
+
+    check = sqlite3.connect(path)
+    try:
+        assert check.execute(
+            "SELECT COUNT(*) FROM room_bindings"
+        ).fetchone()[0] == 0
+        assert check.execute(
+            """
+            SELECT COUNT(*)
+            FROM sqlite_schema
+            WHERE type = 'trigger' AND name = 'reject_binding_insert'
+            """
+        ).fetchone()[0] == 1
+    finally:
+        check.close()
+
+
+def test_post_open_trigger_error_is_binding_operational_and_rolls_back(
+    registry,
+) -> None:
+    bindings = _bindings()
+    registry._connection.execute(
+        """
+        CREATE TRIGGER reject_binding_insert
+        BEFORE INSERT ON room_bindings
+        BEGIN
+            SELECT RAISE(ABORT, 'unexpected trigger executed');
+        END
+        """
+    )
+
+    with pytest.raises(bindings.BindingDatabaseOpenError):
+        registry.reserve_binding(
+            "c:/repo",
+            AgentName.CODEX,
+            "session",
+            None,
+        )
+
+    assert registry._connection.execute(
+        "SELECT COUNT(*) FROM room_bindings"
+    ).fetchone()[0] == 0
+
+
+def test_post_open_read_error_is_binding_operational(registry) -> None:
+    bindings = _bindings()
+    registry._connection.execute("DROP TABLE room_bindings")
+
+    with pytest.raises(bindings.BindingDatabaseOpenError):
+        registry.resolve_active_binding(
+            "c:/repo",
+            AgentName.CODEX,
+            "session",
+        )
+
+
 @pytest.mark.parametrize(
     ("agent", "state"),
     [
@@ -442,6 +521,35 @@ def test_row_decoder_classifies_invalid_persisted_types(
             ? AS updated_at
         """,
         tuple(values.values()),
+    ).fetchone()
+    try:
+        with pytest.raises(bindings.BindingDatabaseOpenError):
+            bindings._binding_from_row(row)
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    "explicit_name",
+    ("", " ", " padded", "padded ", "line\nbreak", "zero\u200bwidth"),
+)
+def test_row_decoder_rejects_invalid_persisted_room_names(
+    explicit_name: str,
+) -> None:
+    bindings = _bindings()
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    row = connection.execute(
+        """
+        SELECT
+            'c:/repo' AS root_key,
+            'codex' AS agent,
+            'session' AS session_id,
+            ? AS explicit_name,
+            'active' AS state,
+            1000.0 AS updated_at
+        """,
+        (explicit_name,),
     ).fetchone()
     try:
         with pytest.raises(bindings.BindingDatabaseOpenError):
