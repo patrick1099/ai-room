@@ -57,7 +57,7 @@ def checkpoint_fingerprint(root: Path, exact_paths: tuple[Path, ...]) -> str:
     normalized = normalize_exact_paths(root, exact_paths)
     digest = hashlib.sha256()
     resolved_root = Path(root).resolve()
-    for relative in sorted(normalized, key=str.casefold):
+    for relative in sorted(normalized, key=lambda path: (path.casefold(), path)):
         candidate = resolved_root.joinpath(*relative.split("/"))
         content_hash = "MISSING"
         try:

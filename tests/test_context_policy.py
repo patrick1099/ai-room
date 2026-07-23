@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import ai_room.context.policy as policy_module
 from ai_room.context.policy import (
     CompactionAction,
     PreviousContextCheck,
@@ -143,3 +144,31 @@ def test_checkpoint_fingerprint_distinguishes_missing_from_empty(
     empty = checkpoint_fingerprint(tmp_path, (Path("checkpoint.md"),))
 
     assert missing != empty
+
+
+def test_checkpoint_fingerprint_totally_orders_case_colliding_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def preserve_normalized_paths(
+        root: Path,
+        paths: tuple[Path, ...],
+    ) -> tuple[str, ...]:
+        del root
+        return tuple(path.as_posix() for path in paths)
+
+    monkeypatch.setattr(
+        policy_module,
+        "normalize_exact_paths",
+        preserve_normalized_paths,
+    )
+    upper_first = (Path("Docs/A.md"), Path("docs/a.md"))
+    lower_first = tuple(reversed(upper_first))
+
+    assert checkpoint_fingerprint(
+        tmp_path,
+        upper_first,
+    ) == checkpoint_fingerprint(
+        tmp_path,
+        lower_first,
+    )
