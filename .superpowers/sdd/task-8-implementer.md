@@ -73,3 +73,41 @@ installer on base `2cc6d9d`.
 - Commit identity is
   `patrick1099 <245735497+patrick1099@users.noreply.github.com>`.
 - No blocking concerns remain.
+
+## Independent-review safety follow-up
+
+- Review finding 1 was verified: an existing differing skill was treated as a
+  planned write. RED was `1 failed` with `DID NOT RAISE
+  InstallConflictError`. The installer now accepts an existing skill only when
+  its bytes equal the repository source; divergent user content is refused
+  during preparation. Focused GREEN was `1 passed in 0.09s`.
+- Review finding 2 was verified across the supplied home and every `.codex`
+  and `.claude` skill ancestor. RED was `7 failed`: raw
+  `FileExistsError` escaped, and a blocked Claude ancestor could fail after a
+  Codex write. The writer path state now distinguishes directories, and
+  preparation validates every existing target ancestor, including the
+  settings backup path when relevant, before returning any write operations.
+  Focused GREEN was `7 passed in 0.14s`.
+- A dedicated backup-path regression replaces the planned backup path with a
+  child of a user-owned file and confirms preparation refuses it before either
+  skill or settings is written.
+- The spaces-only regression now uses both Unicode and spaces in the home and
+  Python executable paths. It verifies the exact `list2cmdline` hook command,
+  successful installation, both byte-identical skill files, and both source
+  SHA-256 values.
+- The atomic-failure regression now reaches the permitted existing-settings
+  update path: exact installed skills remain unchanged, the settings backup
+  succeeds, the settings replace fails, the original settings bytes remain,
+  and the failed temporary sibling is removed. It no longer relies on
+  overwriting a divergent skill, which is intentionally forbidden.
+- Final focused installer suite: `25 passed in 0.46s`.
+- Final bounded full suite:
+  `python -m pytest -vv -o faulthandler_timeout=30` passed
+  `211 passed in 46.96s`.
+- `python -m compileall -q src\ai_room tests\test_install.py` and
+  `git diff --check` exited 0.
+- Eleven review-owned `%TEMP%\ai-room-task8-review-*` directories were removed
+  after their resolved paths were checked to remain under `%TEMP%`; none
+  remains.
+- No real-home or isolated-home `--apply` was run. No Task 9 work or push was
+  performed.

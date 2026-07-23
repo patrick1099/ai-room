@@ -36,6 +36,7 @@ class InstallConflictError(InstallError):
 class PathState(StrEnum):
     MISSING = "missing"
     FILE = "file"
+    DIRECTORY = "directory"
     OTHER = "other"
 
 
@@ -178,15 +179,9 @@ def _prepare_install(
     writer: InstallWriter,
 ) -> tuple[_PreparedWrite, ...]:
     destinations = (plan.codex_skill, plan.claude_skill, plan.claude_settings)
-    states = {path: writer.state(path) for path in destinations}
-    for path, state in states.items():
-        if state is PathState.OTHER:
-            raise InstallConflictError(
-                f"installation destination is not a regular file: {path}"
-            )
+    states = _preflight_destinations(destinations, writer)
 
     existing_settings: bytes | None = None
-    settings_changed = False
     if states[plan.claude_settings] is PathState.FILE:
         existing_settings = writer.read_bytes(plan.claude_settings)
         settings_data, settings_changed = _merge_settings(
@@ -197,17 +192,21 @@ def _prepare_install(
             None, plan.session_start_group
         )
 
-    prepared: list[_PreparedWrite] = []
-    for path in (plan.codex_skill, plan.claude_skill):
-        prepared.append(_prepare_file(path, plan.skill_bytes, states[path], writer))
-
     if existing_settings is not None and settings_changed:
-        backup_state = writer.state(plan.settings_backup)
+        backup_state = _preflight_destinations(
+            (plan.settings_backup,), writer
+        )[plan.settings_backup]
         if backup_state is not PathState.MISSING:
             raise InstallConflictError(
                 f"settings backup destination already exists: "
                 f"{plan.settings_backup}"
             )
+
+    prepared: list[_PreparedWrite] = []
+    for path in (plan.codex_skill, plan.claude_skill):
+        prepared.append(_prepare_file(path, plan.skill_bytes, states[path], writer))
+
+    if existing_settings is not None and settings_changed:
         prepared.append(_prepared("backup", plan.settings_backup, existing_settings))
 
     if settings_changed:
@@ -217,14 +216,44 @@ def _prepare_install(
     return tuple(prepared)
 
 
+def _preflight_destinations(
+    destinations: tuple[Path, ...],
+    writer: InstallWriter,
+) -> dict[Path, PathState]:
+    states: dict[Path, PathState] = {}
+    checked_ancestors: set[Path] = set()
+    for path in destinations:
+        state = writer.state(path)
+        states[path] = state
+        if state not in (PathState.MISSING, PathState.FILE):
+            raise InstallConflictError(
+                f"installation destination is not a regular file: {path}"
+            )
+        for ancestor in path.parents:
+            if ancestor in checked_ancestors:
+                continue
+            checked_ancestors.add(ancestor)
+            ancestor_state = writer.state(ancestor)
+            if ancestor_state in (PathState.MISSING, PathState.DIRECTORY):
+                continue
+            raise InstallConflictError(
+                f"installation ancestor is not a directory: {ancestor}"
+            )
+    return states
+
+
 def _prepare_file(
     path: Path,
     desired: bytes,
     state: PathState,
     writer: InstallWriter,
 ) -> _PreparedWrite:
-    if state is PathState.FILE and writer.read_bytes(path) == desired:
-        return _prepared("unchanged", path, None, desired)
+    if state is PathState.FILE:
+        if writer.read_bytes(path) == desired:
+            return _prepared("unchanged", path, None, desired)
+        raise InstallConflictError(
+            f"existing skill differs from repository source: {path}"
+        )
     return _prepared("write", path, desired)
 
 
@@ -334,6 +363,8 @@ def _path_state(path: Path) -> PathState:
         return PathState.OTHER
     if path.is_file():
         return PathState.FILE
+    if path.is_dir():
+        return PathState.DIRECTORY
     if path.exists():
         return PathState.OTHER
     return PathState.MISSING
