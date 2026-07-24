@@ -821,6 +821,53 @@ def test_guard_violation_downgrades_the_reply_to_blocked(cli_workspace) -> None:
     assert result["guard_violations"] == ["source.py"]
 
 
+def test_reply_without_wait_reports_task_not_delivered(cli_workspace) -> None:
+    workspace, _, codex_env, claude_env = cli_workspace
+    assert _run_cli(workspace, codex_env, "join", "codex").returncode == 0
+    assert _run_cli(workspace, claude_env, "join", "claude").returncode == 0
+    sent = _run_cli(
+        workspace,
+        codex_env,
+        "send",
+        "--to",
+        "claude",
+        "--type",
+        "decision",
+        "--question",
+        "只做决定",
+    )
+    task_id = _assert_one_json_object(sent.stdout)["result"]["task_id"]
+
+    completed = _run_cli(
+        workspace,
+        claude_env,
+        "reply",
+        task_id,
+        "--outcome",
+        "done",
+        "--message",
+        "采用方案甲",
+    )
+
+    assert completed.returncode == 3
+    error = _assert_one_json_object(completed.stderr)["error"]
+    assert error["code"] == "task_not_delivered"
+    assert "ai-room wait" in error["message"]
+    assert _run_cli(workspace, claude_env, "wait").returncode == 0
+    retried = _run_cli(
+        workspace,
+        claude_env,
+        "reply",
+        task_id,
+        "--outcome",
+        "done",
+        "--message",
+        "采用方案甲",
+    )
+    assert retried.returncode == 0
+    assert _assert_one_json_object(retried.stdout)["result"]["state"] == "done"
+
+
 def test_keyboard_interrupt_during_wait_returns_130_only(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

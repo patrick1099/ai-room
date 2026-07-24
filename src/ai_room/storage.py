@@ -49,6 +49,22 @@ class TaskConflictError(StorageError):
     """Raised when an idempotency key or task transition conflicts."""
 
 
+class TaskNotDeliveredError(TaskConflictError):
+    """Raised when an agent replies to a round it has never received.
+
+    A task turns ``working`` as soon as its request message exists, which is
+    before any agent has picked it up. Replying then has no round window to
+    guard, so the reply is refused with the one command that opens it.
+    """
+
+    def __init__(self, task_id: str) -> None:
+        self.task_id = task_id
+        super().__init__(
+            f"task {task_id} has not been delivered to this session yet; "
+            "run `ai-room wait` to receive it, then reply."
+        )
+
+
 class SchemaVersionError(StorageError):
     """Raised when an existing database uses an unsupported schema."""
 

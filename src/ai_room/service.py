@@ -34,6 +34,7 @@ from .storage import (
     RoomStatus,
     SQLiteStore,
     TaskConflictError,
+    TaskNotDeliveredError,
 )
 from .workspace_guard import (
     build_guard_notice,
@@ -185,7 +186,7 @@ class AiRoomService:
         if task.request.recipient is self._agent:
             baseline = self._store.get_workspace_baseline(task_id, task.round_no)
             if baseline is None:
-                raise TaskConflictError("task round has no workspace baseline")
+                raise TaskNotDeliveredError(task_id)
             after = capture_workspace(self._room.root)
             writable_docs = self._writable_docs_for(task)
             violations = compare_workspace(baseline, after, writable_docs).violations

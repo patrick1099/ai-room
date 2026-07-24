@@ -50,6 +50,7 @@ from .storage import (
     SchemaVersionError,
     StorageError,
     TaskConflictError,
+    TaskNotDeliveredError,
 )
 from .workspace_guard import (
     WorkspaceCaptureError,
@@ -415,6 +416,9 @@ def main(
         return EXIT_OPERATIONAL
     except MalformedMessageError as error:
         _write_error(errors, "malformed_message", str(error))
+        return EXIT_OPERATIONAL
+    except TaskNotDeliveredError as error:
+        _write_error(errors, "task_not_delivered", str(error))
         return EXIT_OPERATIONAL
     except TaskConflictError as error:
         _write_error(errors, "task_conflict", str(error))

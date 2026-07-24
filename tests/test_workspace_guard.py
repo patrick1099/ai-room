@@ -22,7 +22,7 @@ from ai_room.domain import (
     TaskState,
 )
 from ai_room.service import AiRoomService
-from ai_room.storage import SQLiteStore
+from ai_room.storage import SQLiteStore, TaskNotDeliveredError
 from ai_room.workspace_guard import (
     GUARD_NOTICE_PATH_LIMIT,
     capture_workspace,
@@ -393,6 +393,35 @@ def test_service_allows_only_the_exact_document_from_request(
     result = advisor.reply(sent.task_id, TaskOutcome.DONE, "完成")
 
     assert result.state is TaskState.DONE
+
+
+def test_reply_before_delivery_names_the_command_that_unblocks_it(
+    guarded_services,
+) -> None:
+    """`working` only means the request exists, not that the advisor holds it."""
+    primary, advisor, _, _ = guarded_services
+    sent = primary.send(_request())
+
+    with pytest.raises(TaskNotDeliveredError) as error:
+        advisor.reply(sent.task_id, TaskOutcome.DONE, "完成")
+
+    message = str(error.value)
+    assert sent.task_id in message
+    assert "ai-room wait" in message
+
+
+def test_a_premature_reply_leaves_the_task_repliable(guarded_services) -> None:
+    """The refusal must cost one command, not the whole round."""
+    primary, advisor, _, _ = guarded_services
+    sent = primary.send(_request())
+    with pytest.raises(TaskNotDeliveredError):
+        advisor.reply(sent.task_id, TaskOutcome.DONE, "完成")
+
+    assert advisor.wait(threading.Event()) is not None
+    result = advisor.reply(sent.task_id, TaskOutcome.DONE, "完成")
+
+    assert result.state is TaskState.DONE
+    assert result.guard_violations == ()
 
 
 def test_redelivery_reuses_original_round_baseline(guarded_services) -> None:

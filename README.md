@@ -122,7 +122,9 @@ ai-room send --to claude --type design-review --question "确认状态机边界"
 
 ### `reply`
 
-顾问对已投递任务回复一次：
+顾问对**已经通过 `wait` 收到**的任务回复一次。任务在 `send` 之后立即变成 `working`，但那只表示
+请求消息已经存在、可以被领取；只有 `wait` 真正投递时才会拍下工作树基线。因此从 `status` 抄一个
+task ID 直接 `reply` 会被拒绝（`task_not_delivered`），先跑一次 `wait` 即可：
 
 ```powershell
 ai-room reply TASK_ID --outcome done --message "采用方案 A"
@@ -185,6 +187,9 @@ Codex 从当前 `CODEX_THREAD_ID` 对应的 token 记录读取输入 token；Cla
 - `room_binding_missing`：当前会话尚未加入；执行 `join`。若要换命名房间，先 `leave`。
 - `room_database_missing` 或 schema 错误：保留现场，不要自行删除数据库；先备份
   `%LOCALAPPDATA%/ai-room` 再诊断。
+- `task_not_delivered`：这一轮还没有投递到当前会话，因此没有工作树基线可比。执行一次
+  `ai-room wait` 收下该任务（租约到期后会重新投递同一 message ID），再 `reply`。任务不会因此
+  丢失或卡死。
 - reply 结果里 `state` 变成 `blocked` 且 `guard_violations` 非空：任务窗口内有 `writable_docs`
   之外的文件发生变化，这一轮被判为未完成。ai-room 只能看到「变了什么」，看不到「谁改的」——
   可能是顾问越界，也可能是主聊或你自己在同一工作树里动了文件；请自行判断后决定是否重发任务。
