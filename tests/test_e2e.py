@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,6 +16,7 @@ PROJECT_ROOT = Path(__file__).parents[1]
 CLI = (sys.executable, "-m", "ai_room")
 PROCESS_TIMEOUT = 10
 REDELIVERY_TIMEOUT = 22
+LEASE_EXPIRY_SECONDS = 16
 
 
 @dataclass(frozen=True)
@@ -499,3 +501,56 @@ def test_operator_documents_keep_real_acceptance_pending() -> None:
     assert "真实双窗口验收尚未执行" in acceptance
     for field in ("日期", "Codex 版本", "Claude Code 版本", "工作树根目录", "测试人"):
         assert field in acceptance
+
+
+def test_delivered_reply_does_not_starve_the_next_message(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    _join_both(workspace)
+    first = _run_ok(
+        workspace,
+        "codex",
+        "send",
+        "--to",
+        "claude",
+        "--type",
+        "decision",
+        "--question",
+        "第一个问题？",
+    )
+    first_task = str(first["result"]["task_id"])  # type: ignore[index]
+    request_wait = _start(workspace, "claude", "wait")
+    try:
+        _finish(request_wait)
+    finally:
+        _stop(request_wait)
+    _run_ok(
+        workspace,
+        "claude",
+        "reply",
+        first_task,
+        "--outcome",
+        "done",
+        "--message",
+        "第一个答复。",
+    )
+    reply = _run_ok(workspace, "codex", "wait")
+    assert reply["result"]["task_id"] == first_task  # type: ignore[index]
+
+    second = _run_ok(
+        workspace,
+        "claude",
+        "send",
+        "--to",
+        "codex",
+        "--type",
+        "context-check",
+        "--question",
+        "第二个问题？",
+    )
+    second_task = str(second["result"]["task_id"])  # type: ignore[index]
+    time.sleep(LEASE_EXPIRY_SECONDS)
+
+    delivered = _run_ok(workspace, "codex", "wait")
+    assert delivered["result"]["task_id"] == second_task  # type: ignore[index]

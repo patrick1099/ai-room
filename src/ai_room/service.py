@@ -82,6 +82,7 @@ class AiRoomService:
             lambda: str(uuid.uuid4())
         )
         self._context_adapter = context_adapter
+        self._unacknowledged_reply = False
 
     def join(self) -> MemberView:
         return self._store.join_member(
@@ -261,6 +262,17 @@ class AiRoomService:
             session_id=self._session_id,
         )
 
+    def acknowledge_delivered_reply(self) -> None:
+        """Acknowledge a reply once its recipient has actually received it.
+
+        Callers invoke this after the delivery reached the agent, so a reply
+        stays redeliverable while the process could still fail before that.
+        """
+        if not self._unacknowledged_reply:
+            return
+        self._acknowledge_prior_reply()
+        self._unacknowledged_reply = False
+
     def _acknowledge_prior_reply(self) -> None:
         self._store.acknowledge_informational_replies(
             self._room.room_id,
@@ -291,6 +303,8 @@ class AiRoomService:
         )
         if delivery is not None:
             self._capture_task_baseline(delivery)
+            if delivery.outcome is not None:
+                self._unacknowledged_reply = True
         return delivery
 
     def _maybe_request_context_check(

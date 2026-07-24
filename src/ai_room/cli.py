@@ -212,6 +212,7 @@ def main(
     active_cwd = Path.cwd() if cwd is None else Path(cwd)
     store: SQLiteStore | None = None
     registry: BindingRegistry | None = None
+    service: AiRoomService | None = None
     try:
         identity = detect_current_session(active_environ)
         requested_agent = (
@@ -335,6 +336,8 @@ def main(
                 "result": result,
             },
         )
+        if service is not None:
+            service.acknowledge_delivered_reply()
         return EXIT_SUCCESS
     except _WaitInterrupted:
         return EXIT_CANCEL

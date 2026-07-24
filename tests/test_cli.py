@@ -1054,3 +1054,56 @@ def test_wait_carries_next_entry_to_context_service_paths(
     assert observed == [
         ("resume" if has_waiting_check else "request", "继续 Task 8")
     ]
+
+
+def test_wait_acknowledges_the_reply_it_delivered(cli_workspace) -> None:
+    import sqlite3
+
+    workspace, _, codex_env, claude_env = cli_workspace
+    joined = _assert_one_json_object(
+        _run_cli(workspace, codex_env, "join", "codex").stdout
+    )
+    assert _run_cli(workspace, claude_env, "join", "claude").returncode == 0
+    sent = _run_cli(
+        workspace,
+        codex_env,
+        "send",
+        "--to",
+        "claude",
+        "--type",
+        "decision",
+        "--question",
+        "选方案 A 还是 B？",
+    )
+    task_id = _assert_one_json_object(sent.stdout)["result"]["task_id"]
+    assert _run_cli(workspace, claude_env, "wait").returncode == 0
+    assert (
+        _run_cli(
+            workspace,
+            claude_env,
+            "reply",
+            task_id,
+            "--outcome",
+            "done",
+            "--message",
+            "选方案 A。",
+        ).returncode
+        == 0
+    )
+
+    delivered = _assert_one_json_object(
+        _run_cli(workspace, codex_env, "wait").stdout
+    )
+    message_id = delivered["result"]["message_id"]
+
+    room_database = runtime_root(codex_env) / f"{joined['room']}.sqlite3"
+    connection = sqlite3.connect(room_database)
+    try:
+        row = connection.execute(
+            "SELECT acknowledged_at FROM messages WHERE message_id = ?",
+            (message_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    assert row is not None
+    assert row[0] is not None
