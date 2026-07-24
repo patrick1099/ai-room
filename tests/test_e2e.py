@@ -394,11 +394,11 @@ def test_advisor_reply_is_blocked_after_source_change(tmp_path: Path) -> None:
         "完成",
     )
 
-    assert blocked.returncode == 4
-    assert blocked.stdout == ""
-    error = _parse_compact_json(blocked.stderr)
-    assert error["error"]["code"] == "workspace_guard_violation"  # type: ignore[index]
-    assert error["error"]["violations"] == ["src/module.py"]  # type: ignore[index]
+    assert blocked.returncode == 0
+    assert blocked.stderr == ""
+    result = _parse_compact_json(blocked.stdout)["result"]  # type: ignore[index]
+    assert result["state"] == "blocked"  # type: ignore[index]
+    assert result["guard_violations"] == ["src/module.py"]  # type: ignore[index]
     assert source.read_text(encoding="utf-8") == "VALUE = 2\n"
 
 

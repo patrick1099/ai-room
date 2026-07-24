@@ -14,6 +14,9 @@ from .domain import GuardResult
 
 _GLOB_CHARACTERS = frozenset("*?[]")
 
+#: How many violating paths a downgrade notice spells out before summarising.
+GUARD_NOTICE_PATH_LIMIT = 10
+
 
 @dataclass(frozen=True)
 class WorkspaceSnapshot:
@@ -22,13 +25,28 @@ class WorkspaceSnapshot:
     files: tuple[tuple[str, str], ...]
 
 
-class WorkspaceGuardError(RuntimeError):
-    """Raised when a reply would cross the task's exact write boundary."""
+def build_guard_notice(violations: Iterable[str], advisor_body: str) -> str:
+    """Explain a downgrade without claiming who changed the files.
 
-    def __init__(self, violations: Iterable[str]) -> None:
-        self.violations = tuple(sorted(violations, key=_path_key))
-        changed = ", ".join(self.violations)
-        super().__init__(f"workspace changes outside writable_docs: {changed}")
+    The guard hashes the whole room root, so it can prove that something moved
+    outside ``writable_docs`` but never who moved it: the advisor, the primary
+    still working in the same worktree, or the user. The notice therefore
+    reports the paths and leaves the judgement to whoever reads the reply.
+    """
+    paths = tuple(violations)
+    shown = paths[:GUARD_NOTICE_PATH_LIMIT]
+    label = (
+        f"Paths (first {GUARD_NOTICE_PATH_LIMIT} of {len(paths)})"
+        if len(paths) > GUARD_NOTICE_PATH_LIMIT
+        else "Paths"
+    )
+    return (
+        "Workspace guard downgraded this reply to BLOCKED. "
+        f"{len(paths)} file(s) changed outside writable_docs during this task "
+        "round; ai-room cannot tell whether the advisor, the primary or the "
+        "user changed them, and nothing was reverted. "
+        f"{label}: {', '.join(shown)}. Advisor: {advisor_body}"
+    )
 
 
 class WorkspaceCaptureError(RuntimeError):

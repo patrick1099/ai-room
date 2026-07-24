@@ -24,7 +24,7 @@ from ai_room.domain import (
 from ai_room.service import AiRoomService
 from ai_room.storage import SQLiteStore
 from ai_room.workspace_guard import (
-    WorkspaceGuardError,
+    GUARD_NOTICE_PATH_LIMIT,
     capture_workspace,
     compare_workspace,
     normalize_exact_paths,
@@ -329,7 +329,7 @@ def _request(
     )
 
 
-def test_service_blocks_reply_after_out_of_scope_change_and_preserves_file(
+def test_out_of_scope_change_downgrades_the_reply_and_preserves_the_file(
     guarded_services,
 ) -> None:
     primary, advisor, room_root, _ = guarded_services
@@ -338,12 +338,48 @@ def test_service_blocks_reply_after_out_of_scope_change_and_preserves_file(
     source = room_root / "src" / "app.py"
     source.write_text("advisor edit", encoding="utf-8")
 
-    with pytest.raises(WorkspaceGuardError) as raised:
-        advisor.reply(sent.task_id, TaskOutcome.DONE, "完成")
+    result = advisor.reply(sent.task_id, TaskOutcome.DONE, "完成")
 
-    assert raised.value.violations == ("src/app.py",)
+    assert result.state is TaskState.BLOCKED
+    assert result.guard_violations == ("src/app.py",)
     assert source.read_text(encoding="utf-8") == "advisor edit"
-    assert advisor.status().active_task.state is TaskState.WORKING
+
+
+def test_downgraded_reply_still_reaches_the_sender_with_the_paths(
+    guarded_services,
+) -> None:
+    """A peer or a user writing in the shared tree must not mute the advisor."""
+    primary, advisor, room_root, _ = guarded_services
+    sent = primary.send(_request())
+    assert advisor.wait(threading.Event()) is not None
+    # The advisor touched nothing; somebody else is working in the same tree.
+    (room_root / "src" / "app.py").write_text("primary edit", encoding="utf-8")
+    advisor.reply(sent.task_id, TaskOutcome.DONE, "完成")
+
+    delivered = primary.wait(threading.Event())
+
+    assert delivered is not None
+    assert delivered.outcome is TaskOutcome.BLOCKED
+    assert "src/app.py" in delivered.body
+    assert "完成" in delivered.body
+
+
+def test_guard_notice_caps_the_path_list_but_keeps_the_total(
+    guarded_services,
+) -> None:
+    primary, advisor, room_root, _ = guarded_services
+    sent = primary.send(_request())
+    assert advisor.wait(threading.Event()) is not None
+    for index in range(25):
+        (room_root / "src" / f"noise{index:02d}.py").write_text("x", encoding="utf-8")
+
+    result = advisor.reply(sent.task_id, TaskOutcome.DONE, "完成")
+
+    assert len(result.guard_violations) == 25
+    delivered = primary.wait(threading.Event())
+    assert delivered is not None
+    assert "25" in delivered.body
+    assert delivered.body.count("src/noise") == GUARD_NOTICE_PATH_LIMIT
 
 
 def test_service_allows_only_the_exact_document_from_request(
@@ -371,8 +407,8 @@ def test_redelivery_reuses_original_round_baseline(guarded_services) -> None:
 
     assert redelivered is not None
     assert redelivered.message_id == first.message_id
-    with pytest.raises(WorkspaceGuardError, match="src/app.py"):
-        advisor.reply(sent.task_id, TaskOutcome.DONE, "完成")
+    result = advisor.reply(sent.task_id, TaskOutcome.DONE, "完成")
+    assert result.guard_violations == ("src/app.py",)
 
 
 @pytest.mark.parametrize("kind", [TaskKind.DECISION, TaskKind.CONTEXT_CHECK])
@@ -390,5 +426,7 @@ def test_decision_and_context_tasks_never_allow_workspace_changes(
     assert advisor.wait(threading.Event()) is not None
     (room_root / "docs" / "decision.md").write_text("changed", encoding="utf-8")
 
-    with pytest.raises(WorkspaceGuardError, match="docs/decision.md"):
-        advisor.reply(sent.task_id, TaskOutcome.DONE, "完成")
+    result = advisor.reply(sent.task_id, TaskOutcome.DONE, "完成")
+
+    assert result.state is TaskState.BLOCKED
+    assert result.guard_violations == ("docs/decision.md",)

@@ -76,6 +76,7 @@ class ReplyResult:
     reply_message_id: str
     task_id: str
     state: TaskState
+    guard_violations: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

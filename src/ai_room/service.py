@@ -6,6 +6,7 @@ import os
 import time
 import uuid
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from threading import Event
 
@@ -35,7 +36,7 @@ from .storage import (
     TaskConflictError,
 )
 from .workspace_guard import (
-    WorkspaceGuardError,
+    build_guard_notice,
     capture_workspace,
     compare_workspace,
     normalize_exact_paths,
@@ -180,21 +181,29 @@ class AiRoomService:
     ) -> ReplyResult:
         self._acknowledge_prior_reply()
         task = self._store.get_task(task_id)
+        violations: tuple[str, ...] = ()
         if task.request.recipient is self._agent:
             baseline = self._store.get_workspace_baseline(task_id, task.round_no)
             if baseline is None:
                 raise TaskConflictError("task round has no workspace baseline")
             after = capture_workspace(self._room.root)
             writable_docs = self._writable_docs_for(task)
-            result = compare_workspace(baseline, after, writable_docs)
-            if result.violations:
-                raise WorkspaceGuardError(result.violations)
-        if (
+            violations = compare_workspace(baseline, after, writable_docs).violations
+        if violations:
+            # Refuse to complete the round, but never refuse to speak: silencing
+            # the reply would deadlock the room whenever the primary or the user
+            # touches the shared worktree while the advisor is thinking.
+            outcome = TaskOutcome.BLOCKED
+            body = build_guard_notice(violations, body)
+        elif (
             task.request.kind is TaskKind.CONTEXT_CHECK
             and outcome is TaskOutcome.COMPACT_READY
         ):
             body = self._manual_compaction_reminder(task, body)
-        return self._store.reply(task_id, self._agent, outcome, body)
+        return replace(
+            self._store.reply(task_id, self._agent, outcome, body),
+            guard_violations=violations,
+        )
 
     def resume_context_check(
         self,

@@ -784,7 +784,7 @@ def test_join_rejects_invalid_room_name_without_reserving_binding(
     )
 
 
-def test_guard_violation_is_json_and_exit_four(cli_workspace) -> None:
+def test_guard_violation_downgrades_the_reply_to_blocked(cli_workspace) -> None:
     workspace, _, codex_env, claude_env = cli_workspace
     assert _run_cli(workspace, codex_env, "join", "codex").returncode == 0
     assert _run_cli(workspace, claude_env, "join", "claude").returncode == 0
@@ -814,18 +814,11 @@ def test_guard_violation_is_json_and_exit_four(cli_workspace) -> None:
         "采用方案甲",
     )
 
-    assert completed.returncode == 4
-    assert completed.stdout == ""
-    error = _assert_one_json_object(completed.stderr)
-    assert error == {
-        "ok": False,
-        "error": {
-            "code": "workspace_guard_violation",
-            "message": "Reply blocked by workspace guard: source.py",
-            "violations": ["source.py"],
-        },
-    }
-    assert "Traceback" not in completed.stderr
+    assert completed.returncode == 0
+    assert completed.stderr == ""
+    result = _assert_one_json_object(completed.stdout)["result"]
+    assert result["state"] == "blocked"
+    assert result["guard_violations"] == ["source.py"]
 
 
 def test_keyboard_interrupt_during_wait_returns_130_only(

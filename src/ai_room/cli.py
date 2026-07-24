@@ -53,7 +53,6 @@ from .storage import (
 )
 from .workspace_guard import (
     WorkspaceCaptureError,
-    WorkspaceGuardError,
     normalize_exact_paths,
 )
 
@@ -61,7 +60,6 @@ from .workspace_guard import (
 EXIT_SUCCESS = 0
 EXIT_ARGUMENT = 2
 EXIT_OPERATIONAL = 3
-EXIT_GUARD = 4
 EXIT_CANCEL = 130
 
 _AGENT_LABELS = {
@@ -384,15 +382,6 @@ def main(
     except BindingDatabaseBusyError as error:
         _write_error(errors, "binding_database_busy", str(error))
         return EXIT_OPERATIONAL
-    except WorkspaceGuardError as error:
-        _write_error(
-            errors,
-            "workspace_guard_violation",
-            "Reply blocked by workspace guard: "
-            + ", ".join(error.violations),
-            violations=list(error.violations),
-        )
-        return EXIT_GUARD
     except CliArgumentError as error:
         _write_error(errors, "argument_error", str(error))
         return EXIT_ARGUMENT
@@ -601,6 +590,7 @@ def _command_reply(
         "task_id": reply.task_id,
         "reply_message_id": reply.reply_message_id,
         "state": reply.state.value,
+        "guard_violations": list(reply.guard_violations),
     }
 
 

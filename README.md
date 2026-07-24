@@ -185,7 +185,10 @@ Codex 从当前 `CODEX_THREAD_ID` 对应的 token 记录读取输入 token；Cla
 - `room_binding_missing`：当前会话尚未加入；执行 `join`。若要换命名房间，先 `leave`。
 - `room_database_missing` 或 schema 错误：保留现场，不要自行删除数据库；先备份
   `%LOCALAPPDATA%/ai-room` 再诊断。
-- `workspace_guard_violation`：查看列出的越界路径，让主聊 AI 或用户处理；工具不会代为回滚。
+- reply 结果里 `state` 变成 `blocked` 且 `guard_violations` 非空：任务窗口内有 `writable_docs`
+  之外的文件发生变化，这一轮被判为未完成。ai-room 只能看到「变了什么」，看不到「谁改的」——
+  可能是顾问越界，也可能是主聊或你自己在同一工作树里动了文件；请自行判断后决定是否重发任务。
+  工具不会代为回滚。
 - `database_busy`：确认没有异常长事务，稍后重试；不要删除 WAL 或数据库文件。
 - token 为 `unknown`：检查当前会话 ID、transcript 路径和 JSONL 格式；这不影响普通消息。
 - `wait` 看似无输出：这是正常阻塞状态；用另一窗口 `status` 确认 `waiting`。
