@@ -249,7 +249,11 @@ def main(
         if arguments.command == "ask":
             ask_cwd = Path(arguments.cwd) if arguments.cwd else active_cwd
             room = resolve_room(ask_cwd)
-            result = _command_ask(arguments, room.root, None)
+            try:
+                sender = detect_current_session(active_environ).agent
+            except SessionDetectionError:
+                sender = None
+            result = _command_ask(arguments, room.root, sender)
             ok = bool(result.get("ok"))
             _write_json(
                 output,
@@ -729,7 +733,7 @@ def _command_ask(
         result = driver.invoke(request)
         after = capture_workspace(root)
         guard = compare_workspace(before, after, writable_docs)
-    except DriverTimeout as error:
+    except DriverTimeout:
         _record_ledger(
             arguments,
             root,
@@ -742,7 +746,7 @@ def _command_ask(
             violations=(),
         )
         raise
-    except DriverError as error:
+    except DriverError:
         _record_ledger(
             arguments,
             root,
@@ -751,6 +755,19 @@ def _command_ask(
             request,
             exit_code=-1,
             status="error",
+            session_id=None,
+            violations=(),
+        )
+        raise
+    except WorkspaceCaptureError:
+        _record_ledger(
+            arguments,
+            root,
+            target,
+            related_docs,
+            request,
+            exit_code=-1,
+            status="capture-error",
             session_id=None,
             violations=(),
         )

@@ -1,6 +1,6 @@
 # ai-room `ask` 无头派发 + 台账 plan
 
-> 状态：**已实现**（2026-08-04）。`ask` 命令 + `drivers/` 驱动层 + `.ai-room/ledger.md` 台账已落地，267 个测试通过（含 3 个 `contract` 真机冒烟，默认跳过）。
+> 状态：**已实现**（2026-08-04）。`ask`命令 + `drivers/`驱动层 + `.ai-room/ledger.md`台账已落地，278 个测试通过（另 3 个 `contract`真机冒烟默认跳过，用 `pytest -m contract`单独跑）。
 
 ## 目标
 
@@ -18,8 +18,8 @@
 |---|---|
 | `src/ai_room/drivers/__init__.py` | 导出协议 / 结果 / 注册表 |
 | `src/ai_room/drivers/protocol.py` | `Driver` ABC + `DriverResult` + `DriverError` |
-| `src/ai_room/drivers/claude.py` | `claude -p --output-format json --permission-mode plan ...`，解析 `session_id` |
-| `src/ai_room/drivers/codex.py` | `codex exec --json -s read-only ...`，解析 JSONL 的 `session_id` |
+| `src/ai_room/drivers/claude.py` | `claude -p --output-format json --permission-mode plan` ...（只读默认），解析 `session_id` |
+| `src/ai_room/drivers/codex.py` | `codex exec --json -s read-only` ...（只读默认），解析 JSONL 的 `session_id` |
 | `src/ai_room/drivers/opencode.py` | `opencode run --format json --agent plan ...` |
 | `src/ai_room/drivers/registry.py` | `driver_for(name)` 按名选驱动 |
 | `src/ai_room/ledger.py` | 台账追加：`append_ledger(root, entry)` 写 `.ai-room/ledger.md` |
@@ -31,7 +31,7 @@
 
 ### 说明
 - **不改** `AgentName` 枚举（避免破坏可见会话逻辑）；`ask --to` 用独立 choices `(claude, codex, opencode)`。
-- `--cwd` 指定子 agent 工作目录，台账随之写到该目录 `.ai-room/ledger.md`（解决"打开工作区却聊另一个项目"）。
+- `--cwd`决定针对哪个项目派发；子 agent 实际跑在从该路径解析出的房间根目录，台账写到该根目录 `.ai-room/ledger.md`。
 - 台账格式：每条一个区块（时间 / 状态 / 模型 / 问题 / 相关文档 / 子 agent session id / 续接命令）。
 
 ## 台账样例 `.ai-room/ledger.md`
@@ -58,7 +58,7 @@
 - 账号已确认 `patrick1099`（`245735497+patrick1099@users.noreply.github.com`），当前 `main` 分支。
 ## 2026-08-04 review 修复（对真实 CLI 验证后）
 
-原版三个 driver 从未对真实 CLI 跑过，测试全是自编 payload 喝自己的 parser，导致三套猜错的 schema 一路绿灯合进 main。本次修复：
+原版三个 driver 从未对真实 CLI 跑过，测试全是自编 payload 喂自己的 parser，导致三套猜错的 schema 一路绿灯合进 main。本次修复：
 
 1. `claude`：`--output-format json-1` 非法（实测直接 exit 1），改为 `json`；该格式返回单个对象（非数组），parser 同时接受 dict / list。
 2. `codex`：真实事件是 `thread.started.thread_id` + `item.completed.agent_message`，而不是顶层 `session_id` / `result.payload.status`；保留旧分支兼容。

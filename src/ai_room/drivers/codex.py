@@ -16,8 +16,10 @@ class CodexDriver(Driver):
 
     def invoke(self, request: DriverRequest) -> DriverResult:
         binary = find_binary(self.name, self._BINARY_CANDIDATES)
-        sandbox_mode = (
-            "workspace-write" if not request.read_only else (request.sandbox or "read-only")
+        # An explicit --sandbox always wins; otherwise read-only defaults to
+        # read-only and any writable grant defaults to workspace-write.
+        sandbox_mode = request.sandbox or (
+            "workspace-write" if not request.read_only else "read-only"
         )
         command = [binary, "exec", "--json", "-s", sandbox_mode]
         if request.model:

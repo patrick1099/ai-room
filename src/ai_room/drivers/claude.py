@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 from .process import find_binary, run_cli
 from .protocol import Driver, DriverRequest, DriverResult, compose_prompt
@@ -15,28 +14,21 @@ class ClaudeDriver(Driver):
 
     def invoke(self, request: DriverRequest) -> DriverResult:
         binary = find_binary(self.name, self._BINARY_CANDIDATES)
-        if request.read_only:
-            permission = request.permission_mode or "plan"
-            command = [
-                binary,
-                "-p",
-                "--output-format",
-                "json",
-                "--permission-mode",
-                permission,
-            ]
-        else:
-            command = [
-                binary,
-                "-p",
-                "--output-format",
-                "json",
-                "--permission-mode",
-                "acceptEdits",
-                "--allowedTools",
-                "Edit",
-                "Write",
-            ]
+        # An explicit --permission-mode always wins; otherwise read-only defaults
+        # to plan and any writable grant defaults to acceptEdits.
+        permission = request.permission_mode or (
+            "acceptEdits" if not request.read_only else "plan"
+        )
+        command = [
+            binary,
+            "-p",
+            "--output-format",
+            "json",
+            "--permission-mode",
+            permission,
+        ]
+        if not request.read_only:
+            command += ["--allowedTools", "Edit", "Write"]
         if request.model:
             command += ["--model", request.model]
         command.append(compose_prompt(request))

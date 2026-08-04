@@ -9,9 +9,8 @@ from __future__ import annotations
 
 import io
 import json
+import subprocess
 from pathlib import Path
-
-import pytest
 
 from ai_room.cli import EXIT_OPERATIONAL, EXIT_SUCCESS, main
 from ai_room.drivers.process import DriverTimeout
@@ -171,3 +170,80 @@ def test_ask_no_ledger_skips_file(tmp_path: Path, monkeypatch) -> None:
     )
     assert code == EXIT_SUCCESS
     assert not (tmp_path / ".ai-room" / "ledger.md").exists()
+
+
+class _WritingDriver:
+    """A fake driver that actually writes a file (real-wiring guard test)."""
+
+    def __init__(self, result: DriverResult, file_path: Path, content: str) -> None:
+        self._result = result
+        self._file_path = file_path
+        self._content = content
+
+    def invoke(self, request):
+        self._file_path.parent.mkdir(parents=True, exist_ok=True)
+        self._file_path.write_text(self._content, encoding="utf-8")
+        return self._result
+
+
+def test_ask_guard_real_wiring_detects_untracked_change(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Real capture_workspace/compare_workspace must catch a file the driver
+    wrote outside the writable allow-list, even when the driver reports ok."""
+    from ai_room import cli as cli_module
+    from ai_room.workspace_guard import compare_workspace
+
+    monkeypatch.chdir(tmp_path)
+    # A real git repo so capture_workspace uses the tracked/untracked paths.
+    sub = subprocess.run(
+        ["git", "init", "-q"], cwd=tmp_path, capture_output=True
+    )
+    assert sub.returncode == 0, sub.stderr.decode()
+    (tmp_path / "known.txt").write_text("base", encoding="utf-8")
+    sub = subprocess.run(
+        ["git", "add", "known.txt"], cwd=tmp_path, capture_output=True
+    )
+    assert sub.returncode == 0
+    name = subprocess.run(
+        ["git", "config", "user.email"], cwd=tmp_path, capture_output=True
+    )
+    if not name.stdout.strip():
+        subprocess.run(
+            ["git", "config", "user.email", "t@example.com"],
+            cwd=tmp_path,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "t"], cwd=tmp_path, capture_output=True
+        )
+    sub = subprocess.run(
+        ["git", "commit", "-q", "-m", "init"], cwd=tmp_path, capture_output=True
+    )
+    assert sub.returncode == 0, sub.stderr.decode()
+
+    result = DriverResult(
+        agent="claude",
+        session_id="sess-77",
+        text="done",
+        exit_code=0,
+        stderr="",
+    )
+    # The driver writes secret.txt, which is NOT in writable_docs. Only
+    # driver_for is stubbed; the real guard runs end to end.
+    driver = _WritingDriver(result, tmp_path / "secret.txt", "leak")
+    monkeypatch.setattr(cli_module, "driver_for", lambda name: driver)
+
+    out, err = io.StringIO(), io.StringIO()
+    code = main(
+        ["ask", "--to", "claude", "--question", "q", "--writable-doc", "known.txt"],
+        stdout=out,
+        stderr=err,
+    )
+    assert code == EXIT_OPERATIONAL
+    payload = json.loads(out.getvalue())
+    assert payload["ok"] is False
+    assert payload["result"]["guard_violations"] == ["secret.txt"]
+    ledger = (tmp_path / ".ai-room" / "ledger.md").read_text(encoding="utf-8")
+    assert "`guard-blocked`" in ledger
+    assert "secret.txt" in ledger

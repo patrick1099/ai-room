@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 
 from .process import find_binary, run_cli
 from .protocol import Driver, DriverRequest, DriverResult, compose_prompt
@@ -47,7 +46,9 @@ def _parse_jsonl(stdout: str) -> tuple[str | None, str]:
     ``opencode run --format json`` emits one JSON object per line.  The session
     handle lives on the top-level ``sessionID``; the reply is the ``text`` part
     which may arrive in several fragments, so the last value per ``part.id`` is
-    kept and concatenated in order.
+    kept and concatenated.  Fragments are joined with ``\n``; this is a guess
+    from a single-part capture, so multi-fragment replies may carry extra
+    newlines until the real stream shape is captured.
     """
     session_id: str | None = None
     fragments: dict[str, str] = {}
