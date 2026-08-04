@@ -153,6 +153,23 @@ ai-room status
 ai-room leave
 ```
 
+### `ask`（无头子 agent 派发）
+
+`ask` 把任务无头派发给某厂商 CLI 子 agent（claude / codex / opencode），不依赖可见会话或信箱，
+并把派发记录和子 agent 的 **session id** 追加到项目根目录 `.ai-room/ledger.md` 台账，供续接：
+
+```powershell
+ai-room ask --to claude --question "审查 OTA 升级风险" --related-doc Code/App/Code/app/Protocol/protocol_IoT.c
+ai-room ask --to codex --question "给这个函数加单测" --writable-doc tests/test_protocol.py
+```
+
+- 默认只读：子 agent 被告知不得改文件、不得跑测试/构建。传 `--writable-doc EXACT_PATH` 才放开
+  只写这些文件；派发结束后 `workspace_guard` 会复核边界，越界改动记为 `guard-blocked`。
+- `--cwd` 决定针对哪个项目派发；子 agent 实际跑在从该路径解析出的房间根目录。
+- 退出码 0 = 成功且无越界；失败 / 超时 / 越界一律退出 3。超时也会在台账留下 `timeout` 记录。
+- 台账写 `.ai-room/`，并自动生成 `.ai-room/.gitignore`（`*`）避免被提交进仓库。
+- 续接：`claude -r SESSION_ID`、`codex exec resume SESSION_ID`、`opencode run --session SESSION_ID`。
+
 ## 运行数据、恢复与并发
 
 运行数据位于 `%LOCALAPPDATA%/ai-room`，不会写进项目仓库。每个规范化工作树根目录对应独立

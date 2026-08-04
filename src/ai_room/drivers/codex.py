@@ -3,72 +3,63 @@
 from __future__ import annotations
 
 import json
-import shutil
 import subprocess
 from pathlib import Path
 
-from .protocol import Driver, DriverError, DriverResult
+from .process import find_binary, run_cli
+from .protocol import Driver, DriverRequest, DriverResult, compose_prompt
 
 
 class CodexDriver(Driver):
     name = "codex"
     _BINARY_CANDIDATES = ("codex", "codex.exe")
 
-    def _binary(self) -> str:
-        for name in self._BINARY_CANDIDATES:
-            path = shutil.which(name)
-            if path:
-                return path
-        raise DriverError("codex CLI not found on PATH")
-
-    def invoke(
-        self,
-        question: str,
-        *,
-        cwd: Path,
-        model: str | None = None,
-        timeout: float = 300.0,
-        permission_mode: str | None = None,
-        sandbox: str | None = None,
-        allowed_write: tuple[str, ...] = (),
-    ) -> DriverResult:
-        del permission_mode
-        del allowed_write
-        binary = self._binary()
-        sandbox_mode = sandbox or "read-only"
+    def invoke(self, request: DriverRequest) -> DriverResult:
+        binary = find_binary(self.name, self._BINARY_CANDIDATES)
+        sandbox_mode = (
+            "workspace-write" if not request.read_only else (request.sandbox or "read-only")
+        )
         command = [binary, "exec", "--json", "-s", sandbox_mode]
-        if model:
-            command += ["-m", model]
-        command.append(question)
+        if request.model:
+            command += ["-m", request.model]
+        if not _is_git_repo(request.cwd):
+            command += ["--skip-git-repo-check"]
+        command.append(compose_prompt(request))
 
-        proc = _run(command, cwd=cwd, timeout=timeout)
-        session_id, text = _parse_jsonl(proc.stdout)
+        run = run_cli(command, cwd=request.cwd, timeout=request.timeout, agent=self.name)
+        session_id, text = _parse_jsonl(run.stdout)
         return DriverResult(
             agent=self.name,
             session_id=session_id,
             text=text,
-            exit_code=proc.returncode,
-            stderr=proc.stderr.strip(),
+            exit_code=run.returncode,
+            stderr=run.stderr.strip(),
         )
 
 
-def _run(command: list[str], *, cwd: Path, timeout: float) -> subprocess.CompletedProcess:
+def _is_git_repo(cwd: Path) -> bool:
+    """Return True when ``cwd`` is inside a git work tree."""
     try:
-        return subprocess.run(
-            command,
+        result = subprocess.run(
+            ["git", "rev-parse", "--is-inside-work-tree"],
             cwd=cwd,
+            shell=False,
             capture_output=True,
-            text=True,
-            timeout=timeout,
+            timeout=10,
         )
-    except subprocess.TimeoutExpired as error:
-        raise DriverError(f"codex sub-agent timed out after {timeout:g}s") from error
-    except OSError as error:
-        raise DriverError(f"failed to run codex CLI: {error}") from error
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and result.stdout.strip() == b"true"
 
 
 def _parse_jsonl(stdout: str) -> tuple[str | None, str]:
-    """Extract session_id and the completed result text from codex JSONL output."""
+    """Extract the thread id and final agent text from codex JSONL output.
+
+    Real ``codex exec --json`` events carry the session handle on
+    ``thread.started.thread_id`` and the answer on ``item.completed`` with
+    ``item.type == "agent_message"``.  The legacy ``session_id`` / ``result``
+    branches are kept for older codex output.
+    """
     session_id: str | None = None
     parts: list[str] = []
     for line in stdout.splitlines():
@@ -80,11 +71,18 @@ def _parse_jsonl(stdout: str) -> tuple[str | None, str]:
             continue
         if not isinstance(event, dict):
             continue
-        if event.get("session_id"):
-            session_id = event["session_id"]
-        if event.get("type") == "result":
+        sid = event.get("thread_id") or event.get("session_id")
+        if sid:
+            session_id = sid
+        if event.get("type") == "item.completed":
+            item = event.get("item") or {}
+            if isinstance(item, dict) and item.get("type") == "agent_message":
+                text = item.get("text") or ""
+                if text.strip():
+                    parts.append(text)
+        elif event.get("type") == "result":
             payload = event.get("payload") or {}
-            if payload.get("status") == "completed":
+            if isinstance(payload, dict) and payload.get("status") == "completed":
                 text = payload.get("text") or payload.get("final_text") or ""
                 if text.strip():
                     parts.append(text)

@@ -1,56 +1,37 @@
-"""OpenCode (opencode) headless driver.
-
-v1 uses plain-text print mode; session_id is unknown because opencode's JSON
-event schema is not stable across versions. A later pass can parse --format json.
-"""
+"""OpenCode (opencode) headless driver."""
 
 from __future__ import annotations
 
+import json
 import os
-import shutil
-import subprocess
 from pathlib import Path
 
-from .protocol import Driver, DriverError, DriverResult
+from .process import find_binary, run_cli
+from .protocol import Driver, DriverRequest, DriverResult, compose_prompt
 
 
 class OpenCodeDriver(Driver):
     name = "opencode"
+    _BINARY_CANDIDATES = ("opencode", "opencode.cmd", "opencode.ps1")
 
-    def _binary(self) -> str:
-        for name in ("opencode", "opencode.cmd", "opencode.ps1"):
-            path = shutil.which(name)
-            if path:
-                return path
-        raise DriverError("opencode CLI not found on PATH")
+    def invoke(self, request: DriverRequest) -> DriverResult:
+        binary = find_binary(self.name, self._BINARY_CANDIDATES)
+        base = _binary_command(binary)
+        command: list[str] = list(base) + ["run", "--format", "json"]
+        if request.read_only:
+            command += ["--agent", "plan"]
+        if request.model:
+            command += ["--model", request.model]
+        command.append(compose_prompt(request))
 
-    def invoke(
-        self,
-        question: str,
-        *,
-        cwd: Path,
-        model: str | None = None,
-        timeout: float = 300.0,
-        permission_mode: str | None = None,
-        sandbox: str | None = None,
-        allowed_write: tuple[str, ...] = (),
-    ) -> DriverResult:
-        del permission_mode
-        del sandbox
-        del allowed_write
-        base = _binary_command(self._binary())
-        command: list[str] = list(base)
-        if model:
-            command += ["--model", model]
-        command.append(question)
-
-        proc = _run(command, cwd=cwd, timeout=timeout)
+        run = run_cli(command, cwd=request.cwd, timeout=request.timeout, agent=self.name)
+        session_id, text = _parse_jsonl(run.stdout)
         return DriverResult(
             agent=self.name,
-            session_id=None,
-            text=proc.stdout.strip(),
-            exit_code=proc.returncode,
-            stderr=proc.stderr.strip(),
+            session_id=session_id,
+            text=text,
+            exit_code=run.returncode,
+            stderr=run.stderr.strip(),
         )
 
 
@@ -60,18 +41,36 @@ def _binary_command(binary: str) -> list[str]:
     return ["cmd", "/c", binary]
 
 
-def _run(command: list[str], *, cwd: Path, timeout: float) -> subprocess.CompletedProcess:
-    try:
-        return subprocess.run(
-            command,
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired as error:
-        raise DriverError(
-            f"opencode sub-agent timed out after {timeout:g}s"
-        ) from error
-    except OSError as error:
-        raise DriverError(f"failed to run opencode CLI: {error}") from error
+def _parse_jsonl(stdout: str) -> tuple[str | None, str]:
+    """Extract the session id and final text from opencode JSON output.
+
+    ``opencode run --format json`` emits one JSON object per line.  The session
+    handle lives on the top-level ``sessionID``; the reply is the ``text`` part
+    which may arrive in several fragments, so the last value per ``part.id`` is
+    kept and concatenated in order.
+    """
+    session_id: str | None = None
+    fragments: dict[str, str] = {}
+    order: list[str] = []
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("sessionID"):
+            session_id = event["sessionID"]
+        part = event.get("part")
+        if not isinstance(part, dict) or part.get("type") != "text":
+            continue
+        text = part.get("text")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        key = part.get("id") or f"#fragment{len(order)}"
+        if key not in fragments:
+            order.append(key)
+        fragments[key] = text
+    return session_id, "\n".join(fragments[key] for key in order)

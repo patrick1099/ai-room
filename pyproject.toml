@@ -16,8 +16,11 @@ ai-room = "ai_room.cli:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra"
+addopts = "-ra -m 'not contract'"
 pythonpath = ["src"]
+markers = [
+    "contract: runs one real vendor CLI end-to-end (deselected by default)",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

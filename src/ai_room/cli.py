@@ -39,7 +39,7 @@ from .domain import (
     TaskRequest,
     TaskView,
 )
-from .drivers import DriverError, driver_for
+from .drivers import DriverError, DriverRequest, DriverTimeout, driver_for
 from .ledger import LedgerEntry, append_ledger
 from .paths import normalize_root, resolve_room, runtime_root
 from .service import AiRoomService
@@ -56,6 +56,8 @@ from .storage import (
 )
 from .workspace_guard import (
     WorkspaceCaptureError,
+    capture_workspace,
+    compare_workspace,
     normalize_exact_paths,
 )
 
@@ -204,7 +206,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="EXACT_PATH",
     )
     ask.add_argument("--model", metavar="MODEL")
-    ask.add_argument("--cwd", metavar="DIR")
+    ask.add_argument("--cwd", metavar="DIR", help="which project to dispatch against; the sub-agent runs in the room root selected by this path")
     ask.add_argument("--timeout", type=float, default=300.0, metavar="SECONDS")
     ask.add_argument("--permission-mode", dest="permission_mode", metavar="MODE")
     ask.add_argument("--sandbox", metavar="MODE")
@@ -244,31 +246,27 @@ def main(
     registry: BindingRegistry | None = None
     service: AiRoomService | None = None
     try:
+        if arguments.command == "ask":
+            ask_cwd = Path(arguments.cwd) if arguments.cwd else active_cwd
+            room = resolve_room(ask_cwd)
+            result = _command_ask(arguments, room.root, None)
+            ok = bool(result.get("ok"))
+            _write_json(
+                output,
+                {
+                    "ok": ok,
+                    "command": "ask",
+                    "room": room.room_id,
+                    "result": result,
+                },
+            )
+            return EXIT_SUCCESS if ok else EXIT_OPERATIONAL
         identity = detect_current_session(active_environ)
         requested_agent = (
             AgentName(arguments.agent)
             if arguments.command == "join"
             else identity.agent
         )
-        if arguments.command == "ask":
-            ask_cwd = Path(arguments.cwd) if arguments.cwd else active_cwd
-            room = resolve_room(ask_cwd)
-            result = _command_ask(
-                arguments,
-                room.root,
-                identity.agent,
-                errors,
-            )
-            _write_json(
-                output,
-                {
-                    "ok": True,
-                    "command": "ask",
-                    "room": room.room_id,
-                    "result": result,
-                },
-            )
-            return EXIT_SUCCESS
         adapter = adapter_for(requested_agent, active_environ)
         runtime_directory = runtime_root(active_environ)
         registry = BindingRegistry.open(
@@ -699,10 +697,13 @@ def _left_result(agent: AgentName) -> dict[str, object]:
 def _command_ask(
     arguments: argparse.Namespace,
     root: Path,
-    sender: AgentName,
-    stderr: TextIO,
+    sender: AgentName | None,
 ) -> dict[str, object]:
-    """Run one headless sub-agent dispatch and record it in the ledger."""
+    """Run one headless sub-agent dispatch and record it in the ledger.
+
+    ``sender`` is None when the caller could not be identified: ask is a
+    mailbox-less command and must not be blocked by session detection.
+    """
     target = arguments.to
     related_docs = normalize_exact_paths(
         root,
@@ -712,40 +713,105 @@ def _command_ask(
         root,
         (Path(value) for value in arguments.writable_doc),
     )
-    driver = driver_for(target)
-    result = driver.invoke(
-        arguments.question,
+    request = DriverRequest(
+        question=arguments.question,
         cwd=root,
         model=arguments.model,
         timeout=arguments.timeout,
         permission_mode=arguments.permission_mode,
         sandbox=arguments.sandbox,
-        allowed_write=writable_docs,
+        related_docs=related_docs,
+        writable_docs=writable_docs,
     )
-    ledger_path: Path | None = None
-    if not arguments.no_ledger:
-        ledger_path = append_ledger(
+    driver = driver_for(target)
+    before = capture_workspace(root)
+    try:
+        result = driver.invoke(request)
+        after = capture_workspace(root)
+        guard = compare_workspace(before, after, writable_docs)
+    except DriverTimeout as error:
+        _record_ledger(
+            arguments,
             root,
-            LedgerEntry(
-                agent=target,
-                question=arguments.question,
-                session_id=result.session_id,
-                related_docs=related_docs,
-                model=arguments.model,
-                exit_code=result.exit_code,
-                status="ok" if result.ok else "error",
-            ),
+            target,
+            related_docs,
+            request,
+            exit_code=-1,
+            status="timeout",
+            session_id=None,
+            violations=(),
         )
+        raise
+    except DriverError as error:
+        _record_ledger(
+            arguments,
+            root,
+            target,
+            related_docs,
+            request,
+            exit_code=-1,
+            status="error",
+            session_id=None,
+            violations=(),
+        )
+        raise
+
+    status = "ok" if result.ok else "error"
+    if guard.violations:
+        status = "guard-blocked"
+    ledger_path = _record_ledger(
+        arguments,
+        root,
+        target,
+        related_docs,
+        request,
+        exit_code=result.exit_code,
+        status=status,
+        session_id=result.session_id,
+        violations=guard.violations,
+    )
+    ok = result.ok and not guard.violations
     return {
+        "ok": ok,
         "agent": target,
-        "sender": sender.value,
+        "sender": None if sender is None else sender.value,
         "session_id": result.session_id,
-        "ok": result.ok,
         "exit_code": result.exit_code,
         "text": result.text,
         "stderr": result.stderr,
+        "guard_violations": list(guard.violations),
         "ledger": None if ledger_path is None else str(ledger_path),
     }
+
+
+def _record_ledger(
+    arguments: argparse.Namespace,
+    root: Path,
+    target: str,
+    related_docs: tuple[str, ...],
+    request: DriverRequest,
+    *,
+    exit_code: int,
+    status: str,
+    session_id: str | None,
+    violations: tuple[str, ...],
+) -> Path | None:
+    """Append one ledger entry unless --no-ledger was given."""
+    if arguments.no_ledger:
+        return None
+    return append_ledger(
+        root,
+        LedgerEntry(
+            agent=target,
+            question=request.question,
+            session_id=session_id,
+            related_docs=related_docs,
+            model=request.model,
+            exit_code=exit_code,
+            status=status,
+            violations=violations,
+        ),
+    )
 
 
 _COMMANDS = {

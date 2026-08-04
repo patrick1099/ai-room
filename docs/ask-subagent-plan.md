@@ -1,58 +1,71 @@
-# ai-room `ask` ÎŞÍ·ÅÉ·¢ + Ì¨ÕË plan
+# ai-room `ask` æ— å¤´æ´¾å‘ + å°è´¦ plan
 
-> ×´Ì¬£º**ÒÑÊµÏÖ**£¨2026-08-04£©¡£`ask` ÃüÁî + `drivers/` Çı¶¯²ã + `.ai-room/ledger.md` Ì¨ÕËÒÑÂäµØ£¬244 ¸ö²âÊÔÍ¨¹ı¡£
+> çŠ¶æ€ï¼š**å·²å®ç°**ï¼ˆ2026-08-04ï¼‰ã€‚`ask` å‘½ä»¤ + `drivers/` é©±åŠ¨å±‚ + `.ai-room/ledger.md` å°è´¦å·²è½åœ°ï¼Œ267 ä¸ªæµ‹è¯•é€šè¿‡ï¼ˆå« 3 ä¸ª `contract` çœŸæœºå†’çƒŸï¼Œé»˜è®¤è·³è¿‡ï¼‰ã€‚
 
-## Ä¿±ê
+## ç›®æ ‡
 
-ĞÂÔö `ai-room ask` ÃüÁî£¬°ÑÈÎÎñÎŞÍ·ÅÉ·¢¸øÆäËü³§ÉÌ CLI ×Ó agent£¨claude / codex / opencode£©£¬
-ÄÃµ½×Ó agent µÄ **session id**£¬²¢×Ô¶¯×·¼Óµ½ÏîÄ¿¸ùÄ¿Â¼ `.ai-room/ledger.md` Ì¨ÕË£¬
-¹© `-r/--resume` Ğø½Ó¸Ã´Î»á»°¡£
+æ–°å¢ `ai-room ask` å‘½ä»¤ï¼ŒæŠŠä»»åŠ¡æ— å¤´æ´¾å‘ç»™å…¶å®ƒå‚å•† CLI å­ agentï¼ˆclaude / codex / opencodeï¼‰ï¼Œ
+æ‹¿åˆ°å­ agent çš„ **session id**ï¼Œå¹¶è‡ªåŠ¨è¿½åŠ åˆ°é¡¹ç›®æ ¹ç›®å½• `.ai-room/ledger.md` å°è´¦ï¼Œ
+ä¾› `-r/--resume` ç»­æ¥è¯¥æ¬¡ä¼šè¯ã€‚
 
-±³¾°£ºÏÖÓĞÁù´óÃüÁî£¨join / wait / send / reply / status / leave£©¶¼ÒÀÀµ**¿É¼û½»»¥»á»°**¡£
-`ask` °Ñ"Í¬°é"´Ó¿É¼û»á»°½âñî³ÉÎŞÍ·×Ó agent£¬ÌìÈ»Ö§³Ö¶à³§ÉÌ£¬ÇÒÄÜ¼ÇÂ¼¿ÉĞø½ÓµÄ»á»° id¡£
+èƒŒæ™¯ï¼šç°æœ‰å…­å¤§å‘½ä»¤ï¼ˆjoin / wait / send / reply / status / leaveï¼‰éƒ½ä¾èµ–**å¯è§äº¤äº’ä¼šè¯**ã€‚
+`ask` æŠŠ"åŒä¼´"ä»å¯è§ä¼šè¯è§£è€¦æˆæ— å¤´å­ agentï¼Œå¤©ç„¶æ”¯æŒå¤šå‚å•†ï¼Œä¸”èƒ½è®°å½•å¯ç»­æ¥çš„ä¼šè¯ idã€‚
 
-## ¸Ä¶¯·¶Î§£¨²Ö¿â `<local-repo-path>`£¬local ÕËºÅÒÑÈ·ÈÏ `patrick1099`£©
+## æ”¹åŠ¨èŒƒå›´ï¼ˆä»“åº“ `<local-repo-path>`ï¼Œlocal è´¦å·å·²ç¡®è®¤ `patrick1099`ï¼‰
 
-### ĞÂÔöÎÄ¼ş
-| ÎÄ¼ş | ÄÚÈİ |
+### æ–°å¢æ–‡ä»¶
+| æ–‡ä»¶ | å†…å®¹ |
 |---|---|
-| `src/ai_room/drivers/__init__.py` | µ¼³öĞ­Òé / ½á¹û / ×¢²á±í |
+| `src/ai_room/drivers/__init__.py` | å¯¼å‡ºåè®® / ç»“æœ / æ³¨å†Œè¡¨ |
 | `src/ai_room/drivers/protocol.py` | `Driver` ABC + `DriverResult` + `DriverError` |
-| `src/ai_room/drivers/claude.py` | `claude -p --output-format json-1 --permission-mode plan ...`£¬½âÎö `session_id` |
-| `src/ai_room/drivers/codex.py` | `codex exec --json -s read-only ...`£¬½âÎö JSONL µÄ `session_id` |
-| `src/ai_room/drivers/opencode.py` | `opencode run ...`£¨v1 ´¿ÎÄ±¾£¬session_id=None£© |
-| `src/ai_room/drivers/registry.py` | `driver_for(name)` °´ÃûÑ¡Çı¶¯ |
-| `src/ai_room/ledger.py` | Ì¨ÕË×·¼Ó£º`append_ledger(root, entry)` Ğ´ `.ai-room/ledger.md` |
+| `src/ai_room/drivers/claude.py` | `claude -p --output-format json --permission-mode plan ...`ï¼Œè§£æ `session_id` |
+| `src/ai_room/drivers/codex.py` | `codex exec --json -s read-only ...`ï¼Œè§£æ JSONL çš„ `session_id` |
+| `src/ai_room/drivers/opencode.py` | `opencode run --format json --agent plan ...` |
+| `src/ai_room/drivers/registry.py` | `driver_for(name)` æŒ‰åé€‰é©±åŠ¨ |
+| `src/ai_room/ledger.py` | å°è´¦è¿½åŠ ï¼š`append_ledger(root, entry)` å†™ `.ai-room/ledger.md` |
 
-### ¸Ä¶¯ÎÄ¼ş
-| ÎÄ¼ş | ¸Ä¶¯ |
+### æ”¹åŠ¨æ–‡ä»¶
+| æ–‡ä»¶ | æ”¹åŠ¨ |
 |---|---|
-| `src/ai_room/cli.py` | ¢Ù ĞÂÔö `ask` ×ÓÃüÁî£¨`--to/--question/--related-doc/--writable-doc/--model/--cwd/--timeout/--permission-mode/--sandbox/--no-ledger`£©¢Ú main Àï¼Ó¶ÀÁ¢ `ask` ·ÖÖ§£¨²»ÒÀÀµ join/binding£¬registry/store ±£³Ö None£©¢Û ¼Ó `DriverError` µÄ except ·ÖÖ§ |
+| `src/ai_room/cli.py` | â‘  æ–°å¢ `ask` å­å‘½ä»¤ï¼ˆ`--to/--question/--related-doc/--writable-doc/--model/--cwd/--timeout/--permission-mode/--sandbox/--no-ledger`ï¼‰â‘¡ main é‡ŒåŠ ç‹¬ç«‹ `ask` åˆ†æ”¯ï¼ˆä¸ä¾èµ– join/bindingï¼Œregistry/store ä¿æŒ Noneï¼‰â‘¢ åŠ  `DriverError` çš„ except åˆ†æ”¯ |
 
-### ËµÃ÷
-- **²»¸Ä** `AgentName` Ã¶¾Ù£¨±ÜÃâÆÆ»µ¿É¼û»á»°Âß¼­£©£»`ask --to` ÓÃ¶ÀÁ¢ choices `(claude, codex, opencode)`¡£
-- `--cwd` Ö¸¶¨×Ó agent ¹¤×÷Ä¿Â¼£¬Ì¨ÕËËæÖ®Ğ´µ½¸ÃÄ¿Â¼ `.ai-room/ledger.md`£¨½â¾ö"´ò¿ª¹¤×÷ÇøÈ´ÁÄÁíÒ»¸öÏîÄ¿"£©¡£
-- Ì¨ÕË¸ñÊ½£ºÃ¿ÌõÒ»¸öÇø¿é£¨Ê±¼ä / ×´Ì¬ / Ä£ĞÍ / ÎÊÌâ / Ïà¹ØÎÄµµ / ×Ó agent session id / Ğø½ÓÃüÁî£©¡£
+### è¯´æ˜
+- **ä¸æ”¹** `AgentName` æšä¸¾ï¼ˆé¿å…ç ´åå¯è§ä¼šè¯é€»è¾‘ï¼‰ï¼›`ask --to` ç”¨ç‹¬ç«‹ choices `(claude, codex, opencode)`ã€‚
+- `--cwd` æŒ‡å®šå­ agent å·¥ä½œç›®å½•ï¼Œå°è´¦éšä¹‹å†™åˆ°è¯¥ç›®å½• `.ai-room/ledger.md`ï¼ˆè§£å†³"æ‰“å¼€å·¥ä½œåŒºå´èŠå¦ä¸€ä¸ªé¡¹ç›®"ï¼‰ã€‚
+- å°è´¦æ ¼å¼ï¼šæ¯æ¡ä¸€ä¸ªåŒºå—ï¼ˆæ—¶é—´ / çŠ¶æ€ / æ¨¡å‹ / é—®é¢˜ / ç›¸å…³æ–‡æ¡£ / å­ agent session id / ç»­æ¥å‘½ä»¤ï¼‰ã€‚
 
-## Ì¨ÕËÑùÀı `.ai-room/ledger.md`
+## å°è´¦æ ·ä¾‹ `.ai-room/ledger.md`
 
 ```markdown
-# ai-room ÅÉ·¢Ì¨ÕË
-> ×Ô¶¯Éú³É£¬ÎğÊÖ¸Ä¡£Ã¿´Î `ai-room ask` ÎŞÍ·ÅÉ·¢ºó×·¼ÓÒ»Ìõ¡£
+# ai-room æ´¾å‘å°è´¦
+> è‡ªåŠ¨ç”Ÿæˆï¼Œå‹¿æ‰‹æ”¹ã€‚æ¯æ¬¡ `ai-room ask` æ— å¤´æ´¾å‘åè¿½åŠ ä¸€æ¡ã€‚
 
-### 2026-08-04T14:00:00+08:00 ¡ª claude [`ok`]
-- ×´Ì¬: ok (exit 0)
-- Ä£ĞÍ: (default)
-- ÎÊÌâ: Éó²é OTA ·½°¸ÔÚ X ÉÏµÄ·çÏÕ
-- Ïà¹ØÎÄµµ: Code/App/Code/app/Protocol/protocol_IoT.c
-- ×Ó agent session id: `abc123`
-- Ğø½Ó: `claude -r abc123`
+### 2026-08-04T14:00:00+08:00 â€” claude [`ok`]
+- çŠ¶æ€: ok (exit 0)
+- æ¨¡å‹: (default)
+- é—®é¢˜: å®¡æŸ¥ OTA æ–¹æ¡ˆåœ¨ X ä¸Šçš„é£é™©
+- ç›¸å…³æ–‡æ¡£: Code/App/Code/app/Protocol/protocol_IoT.c
+- å­ agent session id: `abc123`
+- ç»­æ¥: `claude -r abc123`
 ```
 
-## ²âÊÔ
-- `tests/test_ledger.py`£ºÊ×´Î´´½¨ / ×·¼Ó / Ğø½ÓÌáÊ¾
-- `tests/test_drivers.py`£ºÓÃ mock µÄ `subprocess.run` ÑéÖ¤ claude / codex µÄ session_id ½âÎö£¨²»Õæµ÷ CLI£©
+## æµ‹è¯•
+- `tests/test_ledger.py`ï¼šé¦–æ¬¡åˆ›å»º / è¿½åŠ  / ç»­æ¥æç¤º
+- `tests/test_drivers.py`ï¼šç”¨çœŸå® CLI æ•è·çš„ fixture éªŒè¯ claude / codex / opencode çš„ session_id è§£æï¼Œå¦ç”¨ `pytest -m contract` çœŸæœºå†’çƒŸã€‚
 
-## Ìá½»
-- È«²¿¸Ä¶¯ÔÚ `<local-repo-path>`£¬`git add -A` + commit¡£
-- ÕËºÅÒÑÈ·ÈÏ `patrick1099`£¨`245735497+patrick1099@users.noreply.github.com`£©£¬µ±Ç° `main` ·ÖÖ§¡£
+## æäº¤
+- å…¨éƒ¨æ”¹åŠ¨åœ¨ `<local-repo-path>`ï¼Œ`git add -A` + commitã€‚
+- è´¦å·å·²ç¡®è®¤ `patrick1099`ï¼ˆ`245735497+patrick1099@users.noreply.github.com`ï¼‰ï¼Œå½“å‰ `main` åˆ†æ”¯ã€‚
+## 2026-08-04 review ä¿®å¤ï¼ˆå¯¹çœŸå® CLI éªŒè¯åï¼‰
+
+åŸç‰ˆä¸‰ä¸ª driver ä»æœªå¯¹çœŸå® CLI è·‘è¿‡ï¼Œæµ‹è¯•å…¨æ˜¯è‡ªç¼– payload å–è‡ªå·±çš„ parserï¼Œå¯¼è‡´ä¸‰å¥—çŒœé”™çš„ schema ä¸€è·¯ç»¿ç¯åˆè¿› mainã€‚æœ¬æ¬¡ä¿®å¤ï¼š
+
+1. `claude`ï¼š`--output-format json-1` éæ³•ï¼ˆå®æµ‹ç›´æ¥ exit 1ï¼‰ï¼Œæ”¹ä¸º `json`ï¼›è¯¥æ ¼å¼è¿”å›å•ä¸ªå¯¹è±¡ï¼ˆéæ•°ç»„ï¼‰ï¼Œparser åŒæ—¶æ¥å— dict / listã€‚
+2. `codex`ï¼šçœŸå®äº‹ä»¶æ˜¯ `thread.started.thread_id` + `item.completed.agent_message`ï¼Œè€Œä¸æ˜¯é¡¶å±‚ `session_id` / `result.payload.status`ï¼›ä¿ç•™æ—§åˆ†æ”¯å…¼å®¹ã€‚
+3. `opencode`ï¼šè£¸è°ƒæ˜¯å¯ TUIï¼Œéæ³•é¡¹ç›®è·¯å¾„ï¼›è¡¥ `run --format json --agent plan`ï¼Œè§£æ `sessionID` + `part.text`ã€‚
+4. ç¼–ç ï¼šä¸‰ä¸ª driver çš„ `text=True` åœ¨ cp936 å½“åœ°åŒ–ä¸‹ä¸€è¯´ä¸­æ–‡å°±å´©ï¼›ç»Ÿä¸€æ”¹ç”¨ `encoding="utf-8", errors="replace"` + `stdin=DEVNULL`ï¼ˆæ–° `drivers/process.py`ï¼‰ã€‚
+5. è¾¹ç•Œï¼š`--related-doc`/`--writable-doc` ä»ä¹‹å‰åªè¿›å°è´¦ï¼Œå˜ä¸ºé€šè¿‡ `compose_prompt` çœŸæ­£å‘ç»™å­ agentï¼›ask å¤ç”¨ `capture_workspace`/`compare_workspace` åšè¾¹ç•ŒæŠ¤å«ã€‚
+6. é€€å‡ºç ï¼šå¤±è´¥ / è¶…æ—¶ / è¶Šç•Œå‡è¿”å› 3ï¼Œè¶…æ—¶ä¹Ÿä¼šå†™å°è´¦ï¼ˆ`timeout` çŠ¶æ€ï¼‰ã€‚
+7. æµ‹è¯•ï¼šæ–°å¢ `tests/fixtures/driver_{claude,codex,opencode}.*` çœŸå®æ•è·æ ·æœ¬ï¼Œparser æµ‹è¯•åªåƒè¿™äº›æ ·æœ¬ï¼›`tests/test_process.py` å›å½’ç¼–ç é—®é¢˜ï¼›`tests/test_cli_ask.py` éªŒè¯é€€å‡ºç  / è¶…æ—¶å°è´¦ / è¶Šç•Œï¼›`tests/test_contract.py` çœŸæœºå†’çƒŸï¼ˆé»˜è®¤è·³è¿‡ï¼‰ã€‚
+8. å°è´¦ï¼š`codex` ç»­æ¥æ”¹ä¸ºå­å‘½ä»¤ `codex exec resume ID`ï¼ˆ`--resume` æ˜¯é”™çš„ï¼‰ï¼›status æ‰©å±•ä¸º ok/error/timeout/guard-blockedï¼›é—®é¢˜å•è¡ŒåŒ–æˆªæ–­ï¼›é¦–åˆ›æ—¶å†™ `.ai-room/.gitignore`ï¼ˆ`*`ï¼‰é¿å…è¯¯æäº¤ã€‚
+9. å®‰è£…ï¼š`pip install -e .` é‡è£…ï¼Œä½¿å®‰è£…ç‰ˆä¹Ÿæš´éœ² `ask`ï¼ˆä¹‹å‰ site-packages æ˜¯æ—§ç‰ˆï¼ŒæŠ¥ `invalid choice: ask`ï¼‰ã€‚

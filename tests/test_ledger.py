@@ -27,6 +27,76 @@ def test_append_ledger_creates_file_with_header(tmp_path: Path) -> None:
     assert "\u7eed\u63a5: `claude -r abc123`" in content
 
 
+def test_append_ledger_writes_self_gitignore(tmp_path: Path) -> None:
+    append_ledger(
+        tmp_path,
+        LedgerEntry(
+            agent="codex",
+            question="q",
+            session_id="s",
+            related_docs=(),
+            model=None,
+            exit_code=0,
+            status="ok",
+            timestamp="2026-08-04T14:00:00+08:00",
+        ),
+    )
+    ignore = tmp_path / ".ai-room" / ".gitignore"
+    assert ignore.read_text(encoding="utf-8") == "*\n"
+
+
+def test_resume_hint_codex_is_subcommand(tmp_path: Path) -> None:
+    entry = LedgerEntry(
+        agent="codex",
+        question="question",
+        session_id="thr-1",
+        related_docs=(),
+        model=None,
+        exit_code=0,
+        status="ok",
+        timestamp="2026-08-04T14:00:00+08:00",
+    )
+    path = append_ledger(tmp_path, entry)
+    content = path.read_text(encoding="utf-8")
+    assert "\u7eed\u63a5: `codex exec resume thr-1`" in content
+
+
+def test_append_ledger_records_violations(tmp_path: Path) -> None:
+    entry = LedgerEntry(
+        agent="claude",
+        question="question",
+        session_id="s",
+        related_docs=(),
+        model=None,
+        exit_code=0,
+        status="guard-blocked",
+        timestamp="2026-08-04T14:00:00+08:00",
+        violations=("secret.txt", "other.txt"),
+    )
+    path = append_ledger(tmp_path, entry)
+    content = path.read_text(encoding="utf-8")
+    assert "\u8d8a\u754c\u6587\u4ef6: secret.txt, other.txt" in content
+
+
+def test_question_is_single_lined_and_truncated(tmp_path: Path) -> None:
+    entry = LedgerEntry(
+        agent="claude",
+        question="line one\n\nline two\n### fake heading",
+        session_id="s",
+        related_docs=(),
+        model=None,
+        exit_code=0,
+        status="ok",
+        timestamp="2026-08-04T14:00:00+08:00",
+    )
+    path = append_ledger(tmp_path, entry)
+    content = path.read_text(encoding="utf-8")
+    # The question is flattened onto one line so it cannot create a new heading.
+    assert "\nline one\n" not in content
+    assert "line one line two" in content
+    assert "\n### fake heading" not in content
+
+
 def test_append_ledger_appends_without_duplicate_header(tmp_path: Path) -> None:
     first = LedgerEntry(
         agent="codex",

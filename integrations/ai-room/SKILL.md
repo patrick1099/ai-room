@@ -49,6 +49,26 @@ Only document reviews may carry `--writable-doc`. Use repository-relative,
 exact file paths for `related_docs`, `writable_docs`, and checkpoint documents;
 never send a directory, glob, or vague path.
 
+## Headless sub-agent dispatch (`ask`)
+
+`ask` runs one vendor CLI as a one-shot sub-agent without a visible session or
+mailbox. It records the dispatch and the sub-agent session id in
+`<root>/.ai-room/ledger.md` so the turn can be resumed later.
+
+```text
+ai-room ask --to claude|codex|opencode --question TEXT [--related-doc EXACT_PATH] [--writable-doc EXACT_PATH] [--model MODEL] [--cwd DIR] [--timeout SECONDS] [--permission-mode MODE] [--sandbox MODE] [--no-ledger]
+```
+
+- Default is read-only: the sub-agent is told not to modify files or run
+  tests/builds. Pass `--writable-doc EXACT_PATH` to grant write access to only
+  those files; the workspace guard re-checks the boundary after the turn.
+- `--cwd` selects which project to dispatch against; the sub-agent actually
+  runs in the room root resolved from that path.
+- Exit code 0 means the sub-agent succeeded and wrote nothing outside the
+  writable docs; any failure, timeout, or guard violation exits 3.
+- The sub-agent session id is written to the ledger for `-r/--resume`
+  (`claude -r ID`, `codex exec resume ID`, `opencode run --session ID`).
+
 ## Advisor boundary
 
 As advisor, read source when it is needed to make the requested decision or
