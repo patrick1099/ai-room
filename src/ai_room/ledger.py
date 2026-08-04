@@ -15,11 +15,11 @@ LEDGER_DIRECTORY = ".ai-room"
 LEDGER_FILENAME = "ledger.md"
 
 _HEADER = (
-    "# ai-room dispatch ledger\n\n"
-    "> Auto-generated. Do not edit by hand. One block is appended per "
-    "`ai-room ask` headless dispatch.\n"
-    "> The sub-agent session id allows resuming that conversation with "
-    "`-r/--resume`.\n"
+    "# ai-room \u6d3e\u53d1\u53f0\u8d26\n\n"
+    "> \u81ea\u52a8\u751f\u6210\uff0c\u52ff\u624b\u6539\u3002\u6bcf\u6b21 "
+    "`ai-room ask` \u65e0\u5934\u6d3e\u53d1\u540e\u8ffd\u52a0\u4e00\u6761\u3002\n"
+    "> \u5b50 agent session id \u7528\u4e8e "
+    "`-r/--resume` \u7eed\u63a5\u8be5\u6b21\u4f1a\u8bdd\u3002\n"
 )
 
 
@@ -62,18 +62,18 @@ def _format_entry(entry: LedgerEntry) -> str:
     resume = _resume_hint(entry.agent, entry.session_id)
     return (
         f"\n### {timestamp} - {entry.agent} [`{entry.status}`]\n"
-        f"- status: {entry.status} (exit {entry.exit_code})\n"
-        f"- model: {entry.model or '(default)'}\n"
-        f"- question: {entry.question}\n"
-        f"- related docs: {docs}\n"
-        f"- sub-agent session id: `{entry.session_id or 'unknown'}`\n"
-        f"- resume: {resume}\n"
+        f"- \u72b6\u6001: {entry.status} (exit {entry.exit_code})\n"
+        f"- \u6a21\u578b: {entry.model or '(default)'}\n"
+        f"- \u95ee\u9898: {entry.question}\n"
+        f"- \u76f8\u5173\u6587\u6863: {docs}\n"
+        f"- \u5b50 agent session id: `{entry.session_id or 'unknown'}`\n"
+        f"- \u7eed\u63a5: {resume}\n"
     )
 
 
 def _resume_hint(agent: str, session_id: str | None) -> str:
     if not session_id:
-        return "(no session id, cannot resume)"
+        return "(\u65e0\u4f1a\u8bdd id\uff0c\u65e0\u6cd5\u7eed\u63a5)"
     if agent == "claude":
         return f"`claude -r {session_id}`"
     if agent == "codex":
