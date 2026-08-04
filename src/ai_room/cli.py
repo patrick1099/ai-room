@@ -732,6 +732,9 @@ def _command_ask(
     try:
         result = driver.invoke(request)
     except DriverTimeout:
+        violations = _capture_violations_after(
+            root, before, writable_docs
+        )
         _record_ledger(
             arguments,
             root,
@@ -741,11 +744,14 @@ def _command_ask(
             exit_code=-1,
             status="timeout",
             session_id=None,
-            violations=(),
+            violations=violations,
             sender=sender,
         )
         raise
     except DriverError:
+        violations = _capture_violations_after(
+            root, before, writable_docs
+        )
         _record_ledger(
             arguments,
             root,
@@ -755,7 +761,7 @@ def _command_ask(
             exit_code=-1,
             status="error",
             session_id=None,
-            violations=(),
+            violations=violations,
             sender=sender,
         )
         raise
@@ -778,6 +784,7 @@ def _command_ask(
             session_id=result.session_id,
             violations=(),
             sender=sender,
+            result=result,
         )
         raise
 
@@ -795,6 +802,7 @@ def _command_ask(
         session_id=result.session_id,
         violations=guard.violations,
         sender=sender,
+        result=result,
     )
     ok = result.ok and not guard.violations
     return {
@@ -810,6 +818,25 @@ def _command_ask(
     }
 
 
+def _capture_violations_after(
+    root: Path,
+    before,
+    writable_docs: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Compare the workspace after an interrupted run, best-effort.
+
+    Called from the timeout/error branches so a half-finished sub-agent's
+    out-of-bound writes are still recorded.  A failed capture is swallowed
+    (returns empty) so the original error still propagates.
+    """
+    try:
+        after = capture_workspace(root)
+        guard = compare_workspace(before, after, writable_docs)
+    except WorkspaceCaptureError:
+        return ()
+    return guard.violations
+
+
 def _record_ledger(
     arguments: argparse.Namespace,
     root: Path,
@@ -822,6 +849,7 @@ def _record_ledger(
     session_id: str | None,
     violations: tuple[str, ...],
     sender: str | None = None,
+    result: DriverResult | None = None,
 ) -> Path | None:
     """Append one ledger entry unless --no-ledger was given."""
     if arguments.no_ledger:
@@ -838,6 +866,14 @@ def _record_ledger(
             status=status,
             violations=violations,
             sender=sender,
+            is_error=None if result is None else result.is_error,
+            subtype=None if result is None else result.subtype,
+            permission_denials=()
+            if result is None
+            else result.permission_denials,
+            total_cost_usd=None if result is None else result.total_cost_usd,
+            num_turns=None if result is None else result.num_turns,
+            usage=None if result is None else result.usage,
         ),
     )
 

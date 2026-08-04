@@ -166,9 +166,20 @@ ai-room ask --to codex --question "给这个函数加单测" --writable-doc test
 - 默认只读：子 agent 被告知不得改文件、不得跑测试/构建。传 `--writable-doc EXACT_PATH` 才放开
   只写这些文件；派发结束后 `workspace_guard` 会复核边界，越界改动记为 `guard-blocked`。
 - `--cwd` 决定针对哪个项目派发；子 agent 实际跑在从该路径解析出的房间根目录。
-- 退出码 0 = 成功且无越界；失败 / 超时 / 越界一律退出 3。超时也会在台账留下 `timeout` 记录。
+- 退出码 0 = 成功且无越界；失败 / 超时 / 越界一律退出 3。超时也会先跑守卫复核、在台账留下
+  `timeout` 记录并带上越界文件。
 - 台账写 `.ai-room/`，并自动生成 `.ai-room/.gitignore`（`*`）避免被提交进仓库。
 - 续接：`claude -r SESSION_ID`、`codex exec resume SESSION_ID`、`opencode run --session SESSION_ID`。
+
+ask 的边界复核与可见会话那条路是同一套机制，因此三条免责同样成立：
+
+- **看不到谁改的**：`workspace_guard` 只看「变了什么」，看不出是子 agent、主聊还是你自己在同一
+  工作树里动了文件。
+- **不回滚**：越界改动是被记录并标记 `guard-blocked`，但文件原样留在盘上。退出码 3 不等于「这次
+  派发没生效」——子 agent 可能已经写完了，只是越界被拦在台账里。
+- **不覆盖不看**：守卫会盯着几乎所有文件（包括被 `.gitignore` 忽略的 `.env`、密钥、构建产物），
+  只显式排除 `.git/` 和 `.ai-room/`；但跑子 agent 的进程本身仍可能接触这些文件，守卫只是记录，
+  不代为清理。
 
 ## 运行数据、恢复与并发
 

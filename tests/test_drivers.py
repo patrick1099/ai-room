@@ -41,9 +41,15 @@ def test_unknown_driver_raises() -> None:
 
 def test_claude_parser_handles_real_single_object() -> None:
     """--output-format json returns one object, not a list."""
-    session_id, text = _parse_json(_fixture("driver_claude.json"))
-    assert session_id == "ccf35261-fbc5-4a16-b48c-db4b1b66e966"
-    assert text == "hi"
+    parsed = _parse_json(_fixture("driver_claude.json"))
+    assert parsed.session_id == "ccf35261-fbc5-4a16-b48c-db4b1b66e966"
+    assert parsed.text == "hi"
+    assert parsed.is_error is False
+    assert parsed.subtype == "success"
+    assert parsed.permission_denials == ()
+    assert parsed.total_cost_usd == 0.204492
+    assert parsed.num_turns == 1
+    assert parsed.usage is not None
 
 
 def test_claude_parser_handles_list_legacy() -> None:
@@ -51,38 +57,56 @@ def test_claude_parser_handles_list_legacy() -> None:
         '[{"session_id":"sess-1","type":"assistant","message":{"content":"think"}},'
         '{"session_id":"sess-1","type":"result","result":"final answer"}]'
     )
-    session_id, text = _parse_json(payload)
-    assert session_id == "sess-1"
-    assert text == "final answer"
+    parsed = _parse_json(payload)
+    assert parsed.session_id == "sess-1"
+    assert parsed.text == "final answer"
 
 
 def test_claude_parser_non_json_returns_stdout() -> None:
-    session_id, text = _parse_json("plain text output")
-    assert session_id is None
-    assert text == "plain text output"
+    parsed = _parse_json("plain text output")
+    assert parsed.session_id is None
+    assert parsed.text == "plain text output"
+
+
+def test_claude_parser_captures_permission_denials() -> None:
+    payload = (
+        '{"session_id":"sess-x","type":"result","result":"blocked",'
+        '"is_error":true,"subtype":"error_during_execution",'
+        '"permission_denials":["Edit:/etc/passwd"],"total_cost_usd":0.5,"num_turns":3}'
+    )
+    parsed = _parse_json(payload)
+    assert parsed.is_error is True
+    assert parsed.subtype == "error_during_execution"
+    assert parsed.permission_denials == ("Edit:/etc/passwd",)
+    assert parsed.total_cost_usd == 0.5
+    assert parsed.num_turns == 3
 
 
 def test_codex_parser_handles_real_jsonl() -> None:
     """Real codex JSONL: thread.started.thread_id + item.completed.agent_message."""
-    session_id, text = _parse_codex_jsonl(_fixture("driver_codex.jsonl"))
+    session_id, text, usage = _parse_codex_jsonl(_fixture("driver_codex.jsonl"))
     assert session_id == "019fcac4-11cb-74f3-9b6c-9a08c2ea6730"
     assert text == "hi"
+    assert usage == {
+        "input_tokens": 24626,
+        "cached_input_tokens": 0,
+        "output_tokens": 5,
+        "reasoning_output_tokens": 0,
+    }
 
 
 def test_codex_parser_keeps_legacy_result_payload() -> None:
     payload = (
         '{"session_id":"thr-1","type":"result","payload":{"status":"completed","text":"answer"}}'
     )
-    session_id, text = _parse_codex_jsonl(payload)
+    session_id, text, _ = _parse_codex_jsonl(payload)
     assert session_id == "thr-1"
     assert text == "answer"
 
 
 def test_codex_parser_ignores_failed_result() -> None:
     payload = '{"session_id":"thr-2","type":"result","payload":{"status":"failed","text":"x"}}'
-    session_id, text = _parse_codex_jsonl(payload)
-    assert session_id == "thr-2"
-    assert text == ""
+    session_id, text, _ = _parse_codex_jsonl(payload)
 
 
 def test_opencode_parser_handles_real_jsonl() -> None:
@@ -147,9 +171,13 @@ def _fake_run(command, cwd, timeout, agent):
 
 
 def _capture_argv(
-    monkeypatch, module: str, driver, request: DriverRequest, *, is_git_repo: bool = True
+    monkeypatch, module: str, driver, request: DriverRequest
 ) -> list[str]:
-    """Run ``driver.invoke(request)`` with run_cli stubbed and return the argv."""
+    """Run ``driver.invoke(request)`` with run_cli stubbed and return the argv.
+
+    The ``_is_git_repo`` hook exists only on the codex module, so it is patched
+    automatically when present instead of being a caller-supplied flag.
+    """
     captured: dict[str, list[str]] = {}
 
     def fake_run(command, cwd, timeout, agent):
@@ -158,7 +186,7 @@ def _capture_argv(
 
     monkeypatch.setattr(f"{module}.find_binary", lambda *a, **k: "binary")
     monkeypatch.setattr(f"{module}.run_cli", fake_run)
-    if is_git_repo:
+    if hasattr(__import__(module, fromlist=["x"]), "_is_git_repo"):
         monkeypatch.setattr(f"{module}._is_git_repo", lambda cwd: True)
     driver.invoke(request)
     return captured["command"]
@@ -174,7 +202,6 @@ def test_claude_argv_json_output_format(monkeypatch) -> None:
         "ai_room.drivers.claude",
         ClaudeDriver(),
         DriverRequest(question="q", cwd=Path(".")),
-        is_git_repo=False,
     )
     assert argv[:6] == ["binary", "-p", "--output-format", "json", "--permission-mode", "plan"]
 
@@ -185,7 +212,6 @@ def test_claude_read_only_defaults_plan(monkeypatch) -> None:
         "ai_room.drivers.claude",
         ClaudeDriver(),
         DriverRequest(question="q", cwd=Path(".")),
-        is_git_repo=False,
     )
     assert _value_at(argv, "--permission-mode") == "plan"
     assert "--allowedTools" not in argv
@@ -197,7 +223,6 @@ def test_claude_writable_defaults_accept_edits(monkeypatch) -> None:
         "ai_room.drivers.claude",
         ClaudeDriver(),
         DriverRequest(question="q", cwd=Path("."), writable_docs=("a.c",)),
-        is_git_repo=False,
     )
     assert _value_at(argv, "--permission-mode") == "acceptEdits"
     assert "--allowedTools" in argv
@@ -209,7 +234,6 @@ def test_claude_explicit_permission_always_wins(monkeypatch) -> None:
         "ai_room.drivers.claude",
         ClaudeDriver(),
         DriverRequest(question="q", cwd=Path("."), permission_mode="bypassPermissions"),
-        is_git_repo=False,
     )
     assert _value_at(argv, "--permission-mode") == "bypassPermissions"
 
@@ -260,7 +284,6 @@ def test_opencode_argv_run_format_json(monkeypatch) -> None:
         "ai_room.drivers.opencode",
         OpenCodeDriver(),
         DriverRequest(question="q", cwd=Path(".")),
-        is_git_repo=False,
     )
     assert argv[:4] == ["binary", "run", "--format", "json"]
 
@@ -271,6 +294,5 @@ def test_opencode_read_only_uses_plan_agent(monkeypatch) -> None:
         "ai_room.drivers.opencode",
         OpenCodeDriver(),
         DriverRequest(question="q", cwd=Path(".")),
-        is_git_repo=False,
     )
     assert _value_at(argv, "--agent") == "plan"

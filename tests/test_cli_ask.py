@@ -119,6 +119,49 @@ def test_ask_timeout_writes_error_ledger(tmp_path: Path, monkeypatch) -> None:
     assert "`timeout`" in ledger
 
 
+class _WriteThenRaiseDriver:
+    """A fake driver that writes a file then raises, to probe half-finished
+    runs where the guard must still run after an interrupt."""
+
+    def __init__(self, error: Exception, file_path: Path, content: str) -> None:
+        self._error = error
+        self._file_path = file_path
+        self._content = content
+
+    def invoke(self, request):
+        self._file_path.parent.mkdir(parents=True, exist_ok=True)
+        self._file_path.write_text(self._content, encoding="utf-8")
+        raise self._error
+
+
+def test_ask_timeout_still_records_violations_from_real_guard(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A half-finished run that times out must still run the real guard and
+    record the files it wrote outside the writable allow-list."""
+    from ai_room import cli as cli_module
+
+    monkeypatch.chdir(tmp_path)
+    _init_git_repo(tmp_path)
+    driver = _WriteThenRaiseDriver(
+        DriverTimeout("timed out"), tmp_path / "known.txt", "rewritten"
+    )
+    monkeypatch.setattr(cli_module, "driver_for", lambda name: driver)
+
+    out, err = io.StringIO(), io.StringIO()
+    code = main(
+        ["ask", "--to", "claude", "--question", "q"],
+        stdout=out,
+        stderr=err,
+    )
+    assert code == EXIT_OPERATIONAL
+    ledger = (tmp_path / ".ai-room" / "ledger.md").read_text(encoding="utf-8")
+    assert "`timeout`" in ledger
+    assert "\u8d8a\u754c\u6587\u4ef6" in ledger
+    assert "known.txt" in ledger
+    assert "`timeout`" in ledger
+
+
 def test_ask_capture_error_keeps_session_id_in_ledger(
     tmp_path: Path, monkeypatch
 ) -> None:

@@ -65,9 +65,17 @@ ai-room ask --to claude|codex|opencode --question TEXT [--related-doc EXACT_PATH
 - `--cwd` selects which project to dispatch against; the sub-agent actually
   runs in the room root resolved from that path.
 - Exit code 0 means the sub-agent succeeded and wrote nothing outside the
-  writable docs; any failure, timeout, or guard violation exits 3.
+  writable docs; any failure, timeout, or guard violation exits 3. A timeout
+  still runs the boundary check first and records any out-of-bound files.
 - The sub-agent session id is written to the ledger for `-r/--resume`
   (`claude -r ID`, `codex exec resume ID`, `opencode run --session ID`).
+
+The workspace guard is best-effort, not a sandbox: it records which files
+changed, but cannot tell who changed them (the sub-agent, the primary, or you
+working in the same tree), and it never rolls anything back. It watches almost
+every file, including gitignored secrets and build outputs, and only explicitly
+excludes `.git/` and `.ai-room/`. Exit 3 means "out-of-bound write recorded",
+not "nothing happened".
 
 ## Advisor boundary
 

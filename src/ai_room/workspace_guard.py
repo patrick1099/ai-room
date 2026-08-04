@@ -14,6 +14,13 @@ from .domain import GuardResult
 
 _GLOB_CHARACTERS = frozenset("*?[]")
 
+#: Paths that must never enter the snapshot, regardless of gitignore state.
+#: ``.git`` is git's own state; ``.ai-room`` is the tool's own ledger. These are
+#: "must not see" because they are not user content at all, not because they are
+#: ignored. Everything else - including gitignored secrets and build outputs -
+#: is watched, so a read-only ask cannot silently write into them.
+_SNAPSHOT_EXCLUDED = (".git", ".ai-room")
+
 #: How many violating paths a downgrade notice spells out before summarising.
 GUARD_NOTICE_PATH_LIMIT = 10
 
@@ -178,11 +185,24 @@ def _git_workspace_paths(root: Path) -> tuple[str, ...] | None:
         return None
 
     tracked = _run_git_file_list(root, ["ls-files", "-z"])
-    untracked = _run_git_file_list(
-        root,
-        ["ls-files", "--others", "--exclude-standard", "-z"],
+    # No --exclude-standard: gitignored files (secrets, build outputs) must be
+    # watched too, otherwise a read-only ask can silently write into them. The
+    # snapshot's own excluded dirs are filtered out below instead.
+    untracked = _run_git_file_list(root, ["ls-files", "--others", "-z"])
+    return _exclude_snapshot_paths(tracked + untracked)
+
+
+def _exclude_snapshot_paths(paths: Iterable[str]) -> tuple[str, ...]:
+    """Drop the snapshot's own excluded dirs from a relative path list."""
+    excluded = tuple(
+        path
+        for path in paths
+        if not any(
+            path == name or path.startswith(name + "/")
+            for name in _SNAPSHOT_EXCLUDED
+        )
     )
-    return tracked + untracked
+    return excluded
 
 
 def _run_git_file_list(root: Path, arguments: list[str]) -> tuple[str, ...]:
@@ -218,10 +238,13 @@ def _non_git_paths(root: Path) -> tuple[str, ...]:
         directories[:] = [
             directory
             for directory in directories
-            if runtime is None
-            or not _is_same_or_below(
-                (current_path / directory).resolve(),
-                runtime,
+            if directory not in _SNAPSHOT_EXCLUDED
+            and (
+                runtime is None
+                or not _is_same_or_below(
+                    (current_path / directory).resolve(),
+                    runtime,
+                )
             )
         ]
         for filename in filenames:

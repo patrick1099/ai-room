@@ -29,13 +29,14 @@ class CodexDriver(Driver):
         command.append(compose_prompt(request))
 
         run = run_cli(command, cwd=request.cwd, timeout=request.timeout, agent=self.name)
-        session_id, text = _parse_jsonl(run.stdout)
+        session_id, text, usage = _parse_jsonl(run.stdout)
         return DriverResult(
             agent=self.name,
             session_id=session_id,
             text=text,
             exit_code=run.returncode,
             stderr=run.stderr.strip(),
+            usage=usage,
         )
 
 
@@ -54,16 +55,17 @@ def _is_git_repo(cwd: Path) -> bool:
     return result.returncode == 0 and result.stdout.strip() == b"true"
 
 
-def _parse_jsonl(stdout: str) -> tuple[str | None, str]:
-    """Extract the thread id and final agent text from codex JSONL output.
+def _parse_jsonl(stdout: str) -> tuple[str | None, str, dict | None]:
+    """Extract the thread id, final agent text, and usage from codex JSONL.
 
     Real ``codex exec --json`` events carry the session handle on
-    ``thread.started.thread_id`` and the answer on ``item.completed`` with
-    ``item.type == "agent_message"``.  The legacy ``session_id`` / ``result``
-    branches are kept for older codex output.
+    ``thread.started.thread_id``, the answer on ``item.completed`` with
+    ``item.type == "agent_message"``, and token usage on ``turn.completed``.
+    The legacy ``session_id`` / ``result`` branches are kept for older output.
     """
     session_id: str | None = None
     parts: list[str] = []
+    usage: dict | None = None
     for line in stdout.splitlines():
         if not line.strip():
             continue
@@ -76,6 +78,9 @@ def _parse_jsonl(stdout: str) -> tuple[str | None, str]:
         sid = event.get("thread_id") or event.get("session_id")
         if sid:
             session_id = sid
+        if event.get("type") == "turn.completed":
+            if isinstance(event.get("usage"), dict):
+                usage = event["usage"]
         if event.get("type") == "item.completed":
             item = event.get("item") or {}
             if isinstance(item, dict) and item.get("type") == "agent_message":
@@ -88,4 +93,4 @@ def _parse_jsonl(stdout: str) -> tuple[str | None, str]:
                 text = payload.get("text") or payload.get("final_text") or ""
                 if text.strip():
                     parts.append(text)
-    return session_id, "\n".join(parts)
+    return session_id, "\n".join(parts), usage

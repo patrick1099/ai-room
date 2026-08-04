@@ -16,9 +16,19 @@ class DriverResult:
     text: str
     exit_code: int
     stderr: str
+    # Vendor-authoritative outcome fields (when the CLI exposes them).
+    is_error: bool | None = None
+    subtype: str | None = None
+    permission_denials: tuple[str, ...] = ()
+    total_cost_usd: float | None = None
+    num_turns: int | None = None
+    usage: dict | None = None
 
     @property
     def ok(self) -> bool:
+        # Prefer the vendor's own is_error signal over a guess from exit code.
+        if self.is_error is not None:
+            return not self.is_error and bool(self.text.strip())
         return self.exit_code == 0 and bool(self.text.strip())
 
 

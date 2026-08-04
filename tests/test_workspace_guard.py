@@ -68,18 +68,49 @@ def repo(tmp_path: Path) -> Path:
     return root
 
 
-def test_capture_hashes_tracked_and_visible_untracked_but_not_ignored(
+def test_capture_hashes_tracked_and_visible_untracked_including_ignored(
     repo: Path,
 ) -> None:
+    """Gitignored files (secrets, build outputs) stay watched: a read-only ask
+    must not silently write into them, so the guard must not let --exclude-standard
+    hide them from the snapshot."""
     (repo / "可见.txt").write_text("visible", encoding="utf-8")
     (repo / "ignored").mkdir()
     (repo / "ignored" / "secret.txt").write_text("ignored", encoding="utf-8")
+    (repo / ".env").write_text("KEY=value", encoding="utf-8")
 
     paths = {path for path, _ in capture_workspace(repo).files}
 
     assert "src/已有修改.c" in paths
     assert "可见.txt" in paths
-    assert "ignored/secret.txt" not in paths
+    # Gitignored paths are now deliberately watched.
+    assert "ignored/secret.txt" in paths
+    assert ".env" in paths
+    # The guard's own runtime dirs are still excluded.
+    assert not any(path.startswith(".ai-room/") for path in paths)
+
+
+def test_capture_excludes_ai_room_and_git_dirs(repo: Path) -> None:
+    (repo / ".ai-room").mkdir()
+    (repo / ".ai-room" / "ledger.md").write_text("# ledger", encoding="utf-8")
+
+    paths = {path for path, _ in capture_workspace(repo).files}
+
+    assert not any(path.startswith(".ai-room/") for path in paths)
+    assert not any(path.startswith(".git/") for path in paths)
+
+
+def test_guard_detects_ignored_file_change_after_baseline(repo: Path) -> None:
+    """A gitignored file created/changed during the turn is a violation."""
+    (repo / "ignored").mkdir()
+    (repo / "ignored" / "secret.txt").write_text("base", encoding="utf-8")
+    baseline = capture_workspace(repo)
+
+    (repo / "ignored" / "secret.txt").write_text("leaked", encoding="utf-8")
+
+    assert compare_workspace(
+        baseline, capture_workspace(repo), ()
+    ).violations == ("ignored/secret.txt",)
 
 
 def test_preexisting_dirty_file_is_not_a_violation_until_changed(repo: Path) -> None:

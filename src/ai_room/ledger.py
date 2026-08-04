@@ -7,6 +7,7 @@ question, and the sub-agent session id so the conversation can be resumed.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -37,6 +38,12 @@ class LedgerEntry:
     timestamp: str | None = None
     violations: tuple[str, ...] = ()
     sender: str | None = None
+    is_error: bool | None = None
+    subtype: str | None = None
+    permission_denials: tuple[str, ...] = ()
+    total_cost_usd: float | None = None
+    num_turns: int | None = None
+    usage: dict | None = None
 
 
 def append_ledger(root: Path, entry: LedgerEntry) -> Path:
@@ -78,6 +85,15 @@ def _single_line(text: str, limit: int = 200) -> str:
     return cleaned
 
 
+def _single_line_json(value: dict, limit: int = 200) -> str:
+    """Render a usage dict as one collapsed, truncated line."""
+    try:
+        rendered = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        rendered = str(value)
+    return _single_line(rendered, limit)
+
+
 def _format_entry(entry: LedgerEntry) -> str:
     timestamp = entry.timestamp or datetime.now().astimezone().isoformat(
         timespec="seconds"
@@ -94,6 +110,22 @@ def _format_entry(entry: LedgerEntry) -> str:
         f"- \u5b50 agent session id: `{entry.session_id or 'unknown'}`",
         f"- \u7eed\u63a5: {resume}",
     ]
+    if entry.is_error is not None:
+        lines.append(
+            f"- \u4f9b\u5e94\u5546 is_error: {entry.is_error}"
+            + (f" ({entry.subtype})" if entry.subtype else "")
+        )
+    if entry.permission_denials:
+        lines.append(
+            f"- \u88ab\u62e6\u4e0b\u7684\u8d8a\u754c\u5c1d\u8bd5: "
+            f"{', '.join(entry.permission_denials)}"
+        )
+    if entry.total_cost_usd is not None or entry.num_turns is not None:
+        cost = f"{entry.total_cost_usd:.6f}" if entry.total_cost_usd is not None else "?"
+        turns = entry.num_turns if entry.num_turns is not None else "?"
+        lines.append(f"- \u8d39\u7528: ${cost} USD, {turns} turn(s)")
+    if entry.usage:
+        lines.append(f"- usage: {_single_line_json(entry.usage)}")
     if entry.violations:
         lines.append(
             f"- \u8d8a\u754c\u6587\u4ef6: {', '.join(entry.violations)}"
