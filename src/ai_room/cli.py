@@ -39,6 +39,8 @@ from .domain import (
     TaskRequest,
     TaskView,
 )
+from .drivers import DriverError, driver_for
+from .ledger import LedgerEntry, append_ledger
 from .paths import normalize_root, resolve_room, runtime_root
 from .service import AiRoomService
 from .storage import (
@@ -178,6 +180,35 @@ def build_parser() -> argparse.ArgumentParser:
 
     commands.add_parser("status", help="show room membership and active task")
     commands.add_parser("leave", help="leave without deleting messages")
+
+    ask = commands.add_parser(
+        "ask",
+        help="dispatch one headless sub-agent task and record it in the ledger",
+    )
+    ask.add_argument(
+        "--to",
+        required=True,
+        choices=("claude", "codex", "opencode"),
+    )
+    ask.add_argument("--question", required=True)
+    ask.add_argument(
+        "--related-doc",
+        action="append",
+        default=[],
+        metavar="EXACT_PATH",
+    )
+    ask.add_argument(
+        "--writable-doc",
+        action="append",
+        default=[],
+        metavar="EXACT_PATH",
+    )
+    ask.add_argument("--model", metavar="MODEL")
+    ask.add_argument("--cwd", metavar="DIR")
+    ask.add_argument("--timeout", type=float, default=300.0, metavar="SECONDS")
+    ask.add_argument("--permission-mode", dest="permission_mode", metavar="MODE")
+    ask.add_argument("--sandbox", metavar="MODE")
+    ask.add_argument("--no-ledger", action="store_true")
     return parser
 
 
@@ -219,6 +250,25 @@ def main(
             if arguments.command == "join"
             else identity.agent
         )
+        if arguments.command == "ask":
+            ask_cwd = Path(arguments.cwd) if arguments.cwd else active_cwd
+            room = resolve_room(ask_cwd)
+            result = _command_ask(
+                arguments,
+                room.root,
+                identity.agent,
+                errors,
+            )
+            _write_json(
+                output,
+                {
+                    "ok": True,
+                    "command": "ask",
+                    "room": room.room_id,
+                    "result": result,
+                },
+            )
+            return EXIT_SUCCESS
         adapter = adapter_for(requested_agent, active_environ)
         runtime_directory = runtime_root(active_environ)
         registry = BindingRegistry.open(
@@ -430,6 +480,9 @@ def main(
             f"Workspace capture failed safely: {error.reason}.",
         )
         return EXIT_OPERATIONAL
+    except DriverError as error:
+        _write_error(errors, "subagent_driver_error", str(error))
+        return EXIT_OPERATIONAL
     except CliOperationalError as error:
         _write_error(errors, error.code, str(error))
         return EXIT_OPERATIONAL
@@ -640,6 +693,58 @@ def _left_result(agent: AgentName) -> dict[str, object]:
         "agent": agent.value,
         "status": "left",
         "message": f"{label} left this room; messages were preserved.",
+    }
+
+
+def _command_ask(
+    arguments: argparse.Namespace,
+    root: Path,
+    sender: AgentName,
+    stderr: TextIO,
+) -> dict[str, object]:
+    """Run one headless sub-agent dispatch and record it in the ledger."""
+    target = arguments.to
+    related_docs = normalize_exact_paths(
+        root,
+        (Path(value) for value in arguments.related_doc),
+    )
+    writable_docs = normalize_exact_paths(
+        root,
+        (Path(value) for value in arguments.writable_doc),
+    )
+    driver = driver_for(target)
+    result = driver.invoke(
+        arguments.question,
+        cwd=root,
+        model=arguments.model,
+        timeout=arguments.timeout,
+        permission_mode=arguments.permission_mode,
+        sandbox=arguments.sandbox,
+        allowed_write=writable_docs,
+    )
+    ledger_path: Path | None = None
+    if not arguments.no_ledger:
+        ledger_path = append_ledger(
+            root,
+            LedgerEntry(
+                agent=target,
+                question=arguments.question,
+                session_id=result.session_id,
+                related_docs=related_docs,
+                model=arguments.model,
+                exit_code=result.exit_code,
+                status="ok" if result.ok else "error",
+            ),
+        )
+    return {
+        "agent": target,
+        "sender": sender.value,
+        "session_id": result.session_id,
+        "ok": result.ok,
+        "exit_code": result.exit_code,
+        "text": result.text,
+        "stderr": result.stderr,
+        "ledger": None if ledger_path is None else str(ledger_path),
     }
 
 
