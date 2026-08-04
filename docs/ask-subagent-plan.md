@@ -1,6 +1,6 @@
 # ai-room `ask` 无头派发 + 台账 plan
 
-> 状态：**已实现**（2026-08-04）。`ask`命令 + `drivers/`驱动层 + `.ai-room/ledger.md`台账已落地，278 个测试通过（另 3 个 `contract`真机冒烟默认跳过，用 `pytest -m contract`单独跑）。
+> 状态：**已实现**（2026-08-04）。`ask`命令 + `drivers/`驱动层 + `.ai-room/ledger.md`台账已落地，282 个测试通过（另 3 个 `contract`真机冒烟默认跳过，用 `pytest -m contract`单独跑）。
 
 ## 目标
 

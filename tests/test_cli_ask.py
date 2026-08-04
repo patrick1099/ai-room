@@ -41,24 +41,22 @@ def _run_ask(
     *,
     driver,
     guard: GuardResult | None = None,
-    use_capture: bool = True,
 ) -> tuple[int, dict, str]:
     """Run ``ai-room ask`` against a fake driver and return (code, json, stderr)."""
     from ai_room import cli as cli_module
 
     monkeypatch.setattr(cli_module, "driver_for", lambda name: driver)
-    if use_capture:
-        monkeypatch.setattr(
-            cli_module,
-            "capture_workspace",
-            lambda root: WorkspaceSnapshot(()),
-        )
-        monkeypatch.setattr(
-            cli_module,
-            "compare_workspace",
-            lambda before, after, writable: guard
-            or GuardResult(allowed_changes=(), violations=()),
-        )
+    monkeypatch.setattr(
+        cli_module,
+        "capture_workspace",
+        lambda root: WorkspaceSnapshot(()),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "compare_workspace",
+        lambda before, after, writable: guard
+        or GuardResult(allowed_changes=(), violations=()),
+    )
 
     out, err = io.StringIO(), io.StringIO()
     code = main(
@@ -119,6 +117,47 @@ def test_ask_timeout_writes_error_ledger(tmp_path: Path, monkeypatch) -> None:
     assert err
     ledger = (tmp_path / ".ai-room" / "ledger.md").read_text(encoding="utf-8")
     assert "`timeout`" in ledger
+
+
+def test_ask_capture_error_keeps_session_id_in_ledger(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """After-capture failure must record capture-error with the real session id
+    (the sub-agent already ran and spent a turn), not None."""
+    from ai_room import cli as cli_module
+    from ai_room.workspace_guard import WorkspaceCaptureError
+
+    monkeypatch.chdir(tmp_path)
+    result = DriverResult(
+        agent="claude",
+        session_id="sess-capture",
+        text="done",
+        exit_code=0,
+        stderr="",
+    )
+    monkeypatch.setattr(cli_module, "driver_for", lambda name: _FakeDriver(result))
+    calls = {"n": 0}
+
+    def capture(root):
+        calls["n"] += 1
+        # before (first call) succeeds; after (second call) raises.
+        if calls["n"] == 1:
+            return WorkspaceSnapshot(())
+        raise WorkspaceCaptureError("boom")
+
+    monkeypatch.setattr(cli_module, "capture_workspace", capture)
+    out, err = io.StringIO(), io.StringIO()
+    code = main(
+        ["ask", "--to", "claude", "--question", "q"],
+        stdout=out,
+        stderr=err,
+    )
+    assert code == EXIT_OPERATIONAL
+    assert out.getvalue() == ""
+    assert err
+    ledger = (tmp_path / ".ai-room" / "ledger.md").read_text(encoding="utf-8")
+    assert "`capture-error`" in ledger
+    assert "sess-capture" in ledger
 
 
 def test_ask_guard_blocked_exits_operational(tmp_path: Path, monkeypatch) -> None:
@@ -186,28 +225,14 @@ class _WritingDriver:
         return self._result
 
 
-def test_ask_guard_real_wiring_detects_untracked_change(
-    tmp_path: Path, monkeypatch
-) -> None:
-    """Real capture_workspace/compare_workspace must catch a file the driver
-    wrote outside the writable allow-list, even when the driver reports ok."""
-    from ai_room import cli as cli_module
-    from ai_room.workspace_guard import compare_workspace
-
-    monkeypatch.chdir(tmp_path)
-    # A real git repo so capture_workspace uses the tracked/untracked paths.
-    sub = subprocess.run(
-        ["git", "init", "-q"], cwd=tmp_path, capture_output=True
-    )
+def _init_git_repo(tmp_path: Path) -> None:
+    """Create a minimal git repo with one committed file ``known.txt``."""
+    sub = subprocess.run(["git", "init", "-q"], cwd=tmp_path, capture_output=True)
     assert sub.returncode == 0, sub.stderr.decode()
     (tmp_path / "known.txt").write_text("base", encoding="utf-8")
-    sub = subprocess.run(
-        ["git", "add", "known.txt"], cwd=tmp_path, capture_output=True
-    )
+    sub = subprocess.run(["git", "add", "known.txt"], cwd=tmp_path, capture_output=True)
     assert sub.returncode == 0
-    name = subprocess.run(
-        ["git", "config", "user.email"], cwd=tmp_path, capture_output=True
-    )
+    name = subprocess.run(["git", "config", "user.email"], cwd=tmp_path, capture_output=True)
     if not name.stdout.strip():
         subprocess.run(
             ["git", "config", "user.email", "t@example.com"],
@@ -217,10 +242,20 @@ def test_ask_guard_real_wiring_detects_untracked_change(
         subprocess.run(
             ["git", "config", "user.name", "t"], cwd=tmp_path, capture_output=True
         )
-    sub = subprocess.run(
-        ["git", "commit", "-q", "-m", "init"], cwd=tmp_path, capture_output=True
-    )
+    sub = subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=tmp_path, capture_output=True)
     assert sub.returncode == 0, sub.stderr.decode()
+
+
+def test_ask_guard_real_wiring_detects_untracked_change(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Real capture_workspace/compare_workspace must catch a file the driver
+    wrote outside the writable allow-list, even when the driver reports ok."""
+    from ai_room import cli as cli_module
+
+    monkeypatch.chdir(tmp_path)
+    # A real git repo so capture_workspace uses the tracked/untracked paths.
+    _init_git_repo(tmp_path)
 
     result = DriverResult(
         agent="claude",
@@ -247,3 +282,37 @@ def test_ask_guard_real_wiring_detects_untracked_change(
     ledger = (tmp_path / ".ai-room" / "ledger.md").read_text(encoding="utf-8")
     assert "`guard-blocked`" in ledger
     assert "secret.txt" in ledger
+
+
+def test_ask_guard_real_wiring_allows_writable_doc(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Real guard must pass a change inside the writable allow-list (exit 0)."""
+    from ai_room import cli as cli_module
+
+    monkeypatch.chdir(tmp_path)
+    _init_git_repo(tmp_path)
+
+    result = DriverResult(
+        agent="claude",
+        session_id="sess-88",
+        text="done",
+        exit_code=0,
+        stderr="",
+    )
+    # The driver writes known.txt, which IS the writable doc, so it must pass.
+    driver = _WritingDriver(result, tmp_path / "known.txt", "updated")
+    monkeypatch.setattr(cli_module, "driver_for", lambda name: driver)
+
+    out, err = io.StringIO(), io.StringIO()
+    code = main(
+        ["ask", "--to", "claude", "--question", "q", "--writable-doc", "known.txt"],
+        stdout=out,
+        stderr=err,
+    )
+    assert code == EXIT_SUCCESS
+    payload = json.loads(out.getvalue())
+    assert payload["ok"] is True
+    assert payload["result"]["guard_violations"] == []
+    ledger = (tmp_path / ".ai-room" / "ledger.md").read_text(encoding="utf-8")
+    assert "`ok`" in ledger

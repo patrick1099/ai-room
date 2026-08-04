@@ -146,153 +146,131 @@ def _fake_run(command, cwd, timeout, agent):
     return CompletedRun(returncode=0, stdout="{}", stderr="")
 
 
-def test_claude_argv_json_output_format(monkeypatch) -> None:
-    captured = {}
+def _capture_argv(
+    monkeypatch, module: str, driver, request: DriverRequest, *, is_git_repo: bool = True
+) -> list[str]:
+    """Run ``driver.invoke(request)`` with run_cli stubbed and return the argv."""
+    captured: dict[str, list[str]] = {}
 
     def fake_run(command, cwd, timeout, agent):
         captured["command"] = command
         return _fake_run(command, cwd, timeout, agent)
 
-    monkeypatch.setattr("ai_room.drivers.claude.find_binary", lambda *a, **k: "claude")
-    monkeypatch.setattr("ai_room.drivers.claude.run_cli", fake_run)
-    request = DriverRequest(question="q", cwd=Path("."))
-    ClaudeDriver().invoke(request)
-    assert captured["command"][:5] == ["claude", "-p", "--output-format", "json", "--permission-mode"]
+    monkeypatch.setattr(f"{module}.find_binary", lambda *a, **k: "binary")
+    monkeypatch.setattr(f"{module}.run_cli", fake_run)
+    if is_git_repo:
+        monkeypatch.setattr(f"{module}._is_git_repo", lambda cwd: True)
+    driver.invoke(request)
+    return captured["command"]
+
+
+def _value_at(argv: list[str], flag: str) -> str:
+    return argv[argv.index(flag) + 1]
+
+
+def test_claude_argv_json_output_format(monkeypatch) -> None:
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.claude",
+        ClaudeDriver(),
+        DriverRequest(question="q", cwd=Path(".")),
+        is_git_repo=False,
+    )
+    assert argv[:6] == ["binary", "-p", "--output-format", "json", "--permission-mode", "plan"]
 
 
 def test_claude_read_only_defaults_plan(monkeypatch) -> None:
-    captured = {}
-
-    def fake_run(command, cwd, timeout, agent):
-        captured["command"] = command
-        return _fake_run(command, cwd, timeout, agent)
-
-    monkeypatch.setattr("ai_room.drivers.claude.find_binary", lambda *a, **k: "claude")
-    monkeypatch.setattr("ai_room.drivers.claude.run_cli", fake_run)
-    request = DriverRequest(question="q", cwd=Path("."))
-    ClaudeDriver().invoke(request)
-    assert "--permission-mode" in captured["command"]
-    assert captured["command"][captured["command"].index("--permission-mode") + 1] == "plan"
-    assert "--allowedTools" not in captured["command"]
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.claude",
+        ClaudeDriver(),
+        DriverRequest(question="q", cwd=Path(".")),
+        is_git_repo=False,
+    )
+    assert _value_at(argv, "--permission-mode") == "plan"
+    assert "--allowedTools" not in argv
 
 
 def test_claude_writable_defaults_accept_edits(monkeypatch) -> None:
-    captured = {}
-
-    def fake_run(command, cwd, timeout, agent):
-        captured["command"] = command
-        return _fake_run(command, cwd, timeout, agent)
-
-    monkeypatch.setattr("ai_room.drivers.claude.find_binary", lambda *a, **k: "claude")
-    monkeypatch.setattr("ai_room.drivers.claude.run_cli", fake_run)
-    request = DriverRequest(question="q", cwd=Path("."), writable_docs=("a.c",))
-    ClaudeDriver().invoke(request)
-    assert "--permission-mode" in captured["command"]
-    assert captured["command"][captured["command"].index("--permission-mode") + 1] == "acceptEdits"
-    assert "--allowedTools" in captured["command"]
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.claude",
+        ClaudeDriver(),
+        DriverRequest(question="q", cwd=Path("."), writable_docs=("a.c",)),
+        is_git_repo=False,
+    )
+    assert _value_at(argv, "--permission-mode") == "acceptEdits"
+    assert "--allowedTools" in argv
 
 
 def test_claude_explicit_permission_always_wins(monkeypatch) -> None:
-    captured = {}
-
-    def fake_run(command, cwd, timeout, agent):
-        captured["command"] = command
-        return _fake_run(command, cwd, timeout, agent)
-
-    monkeypatch.setattr("ai_room.drivers.claude.find_binary", lambda *a, **k: "claude")
-    monkeypatch.setattr("ai_room.drivers.claude.run_cli", fake_run)
-    request = DriverRequest(
-        question="q", cwd=Path("."), permission_mode="bypassPermissions"
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.claude",
+        ClaudeDriver(),
+        DriverRequest(question="q", cwd=Path("."), permission_mode="bypassPermissions"),
+        is_git_repo=False,
     )
-    ClaudeDriver().invoke(request)
-    assert "--permission-mode" in captured["command"]
-    assert captured["command"][captured["command"].index("--permission-mode") + 1] == "bypassPermissions"
+    assert _value_at(argv, "--permission-mode") == "bypassPermissions"
 
 
 def test_codex_argv_exec_json(monkeypatch) -> None:
-    captured = {}
-
-    def fake_run(command, cwd, timeout, agent):
-        captured["command"] = command
-        return _fake_run(command, cwd, timeout, agent)
-
-    monkeypatch.setattr("ai_room.drivers.codex.find_binary", lambda *a, **k: "codex")
-    monkeypatch.setattr("ai_room.drivers.codex.run_cli", fake_run)
-    monkeypatch.setattr("ai_room.drivers.codex._is_git_repo", lambda cwd: True)
-    request = DriverRequest(question="q", cwd=Path("."))
-    CodexDriver().invoke(request)
-    assert captured["command"][:4] == ["codex", "exec", "--json", "-s"]
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.codex",
+        CodexDriver(),
+        DriverRequest(question="q", cwd=Path(".")),
+    )
+    assert argv[:4] == ["binary", "exec", "--json", "-s"]
 
 
 def test_codex_read_only_defaults_read_only_sandbox(monkeypatch) -> None:
-    captured = {}
-
-    def fake_run(command, cwd, timeout, agent):
-        captured["command"] = command
-        return _fake_run(command, cwd, timeout, agent)
-
-    monkeypatch.setattr("ai_room.drivers.codex.find_binary", lambda *a, **k: "codex")
-    monkeypatch.setattr("ai_room.drivers.codex.run_cli", fake_run)
-    monkeypatch.setattr("ai_room.drivers.codex._is_git_repo", lambda cwd: True)
-    request = DriverRequest(question="q", cwd=Path("."))
-    CodexDriver().invoke(request)
-    assert captured["command"][4] == "read-only"
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.codex",
+        CodexDriver(),
+        DriverRequest(question="q", cwd=Path(".")),
+    )
+    assert argv[4] == "read-only"
 
 
 def test_codex_writable_defaults_workspace_write(monkeypatch) -> None:
-    captured = {}
-
-    def fake_run(command, cwd, timeout, agent):
-        captured["command"] = command
-        return _fake_run(command, cwd, timeout, agent)
-
-    monkeypatch.setattr("ai_room.drivers.codex.find_binary", lambda *a, **k: "codex")
-    monkeypatch.setattr("ai_room.drivers.codex.run_cli", fake_run)
-    monkeypatch.setattr("ai_room.drivers.codex._is_git_repo", lambda cwd: True)
-    request = DriverRequest(question="q", cwd=Path("."), writable_docs=("a.c",))
-    CodexDriver().invoke(request)
-    assert captured["command"][4] == "workspace-write"
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.codex",
+        CodexDriver(),
+        DriverRequest(question="q", cwd=Path("."), writable_docs=("a.c",)),
+    )
+    assert argv[4] == "workspace-write"
 
 
 def test_codex_explicit_sandbox_always_wins(monkeypatch) -> None:
-    captured = {}
-
-    def fake_run(command, cwd, timeout, agent):
-        captured["command"] = command
-        return _fake_run(command, cwd, timeout, agent)
-
-    monkeypatch.setattr("ai_room.drivers.codex.find_binary", lambda *a, **k: "codex")
-    monkeypatch.setattr("ai_room.drivers.codex.run_cli", fake_run)
-    monkeypatch.setattr("ai_room.drivers.codex._is_git_repo", lambda cwd: True)
-    request = DriverRequest(question="q", cwd=Path("."), sandbox="danger-full-access")
-    CodexDriver().invoke(request)
-    assert captured["command"][4] == "danger-full-access"
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.codex",
+        CodexDriver(),
+        DriverRequest(question="q", cwd=Path("."), sandbox="danger-full-access"),
+    )
+    assert argv[4] == "danger-full-access"
 
 
 def test_opencode_argv_run_format_json(monkeypatch) -> None:
-    captured = {}
-
-    def fake_run(command, cwd, timeout, agent):
-        captured["command"] = command
-        return _fake_run(command, cwd, timeout, agent)
-
-    monkeypatch.setattr("ai_room.drivers.opencode.find_binary", lambda *a, **k: "opencode")
-    monkeypatch.setattr("ai_room.drivers.opencode.run_cli", fake_run)
-    request = DriverRequest(question="q", cwd=Path("."))
-    OpenCodeDriver().invoke(request)
-    assert captured["command"][:4] == ["opencode", "run", "--format", "json"]
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.opencode",
+        OpenCodeDriver(),
+        DriverRequest(question="q", cwd=Path(".")),
+        is_git_repo=False,
+    )
+    assert argv[:4] == ["binary", "run", "--format", "json"]
 
 
 def test_opencode_read_only_uses_plan_agent(monkeypatch) -> None:
-    captured = {}
-
-    def fake_run(command, cwd, timeout, agent):
-        captured["command"] = command
-        return _fake_run(command, cwd, timeout, agent)
-
-    monkeypatch.setattr("ai_room.drivers.opencode.find_binary", lambda *a, **k: "opencode")
-    monkeypatch.setattr("ai_room.drivers.opencode.run_cli", fake_run)
-    request = DriverRequest(question="q", cwd=Path("."))
-    OpenCodeDriver().invoke(request)
-    assert "--agent" in captured["command"]
-    assert captured["command"][captured["command"].index("--agent") + 1] == "plan"
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.opencode",
+        OpenCodeDriver(),
+        DriverRequest(question="q", cwd=Path(".")),
+        is_git_repo=False,
+    )
+    assert _value_at(argv, "--agent") == "plan"

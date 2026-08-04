@@ -731,8 +731,6 @@ def _command_ask(
     before = capture_workspace(root)
     try:
         result = driver.invoke(request)
-        after = capture_workspace(root)
-        guard = compare_workspace(before, after, writable_docs)
     except DriverTimeout:
         _record_ledger(
             arguments,
@@ -744,6 +742,7 @@ def _command_ask(
             status="timeout",
             session_id=None,
             violations=(),
+            sender=sender,
         )
         raise
     except DriverError:
@@ -757,8 +756,16 @@ def _command_ask(
             status="error",
             session_id=None,
             violations=(),
+            sender=sender,
         )
         raise
+
+    # The sub-agent already ran and its session id is in hand; only the
+    # after-capture can raise WorkspaceCaptureError here, so the ledger must
+    # keep the real session id instead of None.
+    try:
+        after = capture_workspace(root)
+        guard = compare_workspace(before, after, writable_docs)
     except WorkspaceCaptureError:
         _record_ledger(
             arguments,
@@ -766,10 +773,11 @@ def _command_ask(
             target,
             related_docs,
             request,
-            exit_code=-1,
+            exit_code=result.exit_code,
             status="capture-error",
-            session_id=None,
+            session_id=result.session_id,
             violations=(),
+            sender=sender,
         )
         raise
 
@@ -786,6 +794,7 @@ def _command_ask(
         status=status,
         session_id=result.session_id,
         violations=guard.violations,
+        sender=sender,
     )
     ok = result.ok and not guard.violations
     return {
@@ -812,6 +821,7 @@ def _record_ledger(
     status: str,
     session_id: str | None,
     violations: tuple[str, ...],
+    sender: str | None = None,
 ) -> Path | None:
     """Append one ledger entry unless --no-ledger was given."""
     if arguments.no_ledger:
@@ -827,6 +837,7 @@ def _record_ledger(
             exit_code=exit_code,
             status=status,
             violations=violations,
+            sender=sender,
         ),
     )
 

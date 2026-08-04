@@ -78,6 +78,39 @@ def test_append_ledger_records_violations(tmp_path: Path) -> None:
     assert "\u8d8a\u754c\u6587\u4ef6: secret.txt, other.txt" in content
 
 
+def test_append_ledger_records_sender(tmp_path: Path) -> None:
+    entry = LedgerEntry(
+        agent="claude",
+        question="question",
+        session_id="s",
+        related_docs=(),
+        model=None,
+        exit_code=0,
+        status="ok",
+        timestamp="2026-08-04T14:00:00+08:00",
+        sender="codex",
+    )
+    path = append_ledger(tmp_path, entry)
+    content = path.read_text(encoding="utf-8")
+    assert "\u53d1\u8d77\u8005: codex" in content
+
+
+def test_append_ledger_sender_defaults_unknown(tmp_path: Path) -> None:
+    entry = LedgerEntry(
+        agent="claude",
+        question="question",
+        session_id="s",
+        related_docs=(),
+        model=None,
+        exit_code=0,
+        status="ok",
+        timestamp="2026-08-04T14:00:00+08:00",
+    )
+    path = append_ledger(tmp_path, entry)
+    content = path.read_text(encoding="utf-8")
+    assert "\u53d1\u8d77\u8005: (unknown)" in content
+
+
 def test_question_is_single_lined_and_truncated(tmp_path: Path) -> None:
     entry = LedgerEntry(
         agent="claude",
