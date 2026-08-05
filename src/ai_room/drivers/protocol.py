@@ -26,56 +26,82 @@ class DriverResult:
 
     @property
     def ok(self) -> bool:
-        # Prefer the vendor's own is_error signal over a guess from exit code.
-        if self.is_error is not None:
-            return not self.is_error and bool(self.text.strip())
+        # The vendor's own is_error is authoritative, but it never excuses a
+        # nonzero exit: a run that crashed after reporting is_error=false did
+        # not succeed.  Both must hold.
+        if self.is_error is not None and self.is_error:
+            return False
         return self.exit_code == 0 and bool(self.text.strip())
+
+
+#: The three permission tiers, ordered from least to most privileged.  Every
+#: driver maps these onto its vendor's native flags; the names are ai-room's,
+#: the semantics must match across vendors.
+PERMISSION_TIERS = ("read-only", "workspace-write", "full-access")
 
 
 @dataclass(frozen=True)
 class DriverRequest:
     """Everything a driver needs to launch one headless sub-agent.
 
-    ``related_docs`` is read-only context handed to the sub-agent.  ``writable_docs``
-    is the exact-path allow-list; when it is empty the sub-agent is read-only and
-    must not touch any file or run tests/builds.
+    ``cwd`` is the sub-agent's working directory and every driver must pin it
+    with its vendor's native flag, never with the process cwd alone: ``opencode
+    run`` ignores the process cwd entirely and will work in whatever project it
+    last remembered.
+
+    ``permission`` is the tier, not a vendor spelling.  ``permission_mode`` and
+    ``sandbox`` stay as raw per-vendor escape hatches and win over the tier when
+    given.  ``related_docs`` is read-only context handed to the sub-agent.
     """
 
     question: str
     cwd: Path
+    permission: str = "read-only"
     model: str | None = None
     timeout: float = 300.0
     permission_mode: str | None = None
     sandbox: str | None = None
     related_docs: tuple[str, ...] = ()
-    writable_docs: tuple[str, ...] = ()
+    extra_dirs: tuple[str, ...] = ()
+    session_id: str | None = None
+    agent_name: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.permission not in PERMISSION_TIERS:
+            tiers = ", ".join(PERMISSION_TIERS)
+            raise ValueError(
+                f"unknown permission tier {self.permission!r} (expected one of {tiers})"
+            )
 
     @property
     def read_only(self) -> bool:
-        """True when no writable paths were granted."""
-        return not self.writable_docs
+        """True when the sub-agent may not write anything."""
+        return self.permission == "read-only"
+
+    @property
+    def full_access(self) -> bool:
+        """True when every sandbox restriction is lifted."""
+        return self.permission == "full-access"
 
 
 def compose_prompt(request: DriverRequest) -> str:
     """Build the prompt actually sent to the sub-agent.
 
-    The related docs and the write boundary are part of the prompt, not just the
-    ledger, otherwise the sub-agent has no idea they exist.
+    The prompt carries context, not policy.  Permission is enforced by the
+    vendor's own flags, so the only thing worth saying is that a read-only run
+    cannot write -- and that is stated as a fact so the sub-agent reports back
+    instead of failing silently, not as a rule it is asked to obey.  A writable
+    run is told nothing extra: it is a worker with hands, and the old advisor
+    wording ("do not run tests or builds") does not apply to it.
     """
     question = request.question
     if request.related_docs:
         lines = "\n".join(f"- {doc}" for doc in request.related_docs)
-        question += f"\n\nRelevant documents (read-only):\n{lines}"
+        question += f"\n\nRelevant documents:\n{lines}"
     if request.read_only:
         question += (
-            "\n\nYou are read-only this run: do not modify any file, "
-            "and do not run tests or builds."
-        )
-    else:
-        writable = ", ".join(request.writable_docs)
-        question += (
-            f"\n\nYou may write only these files: {writable}. "
-            "Do not modify anything else."
+            "\n\nThis run is read-only: file writes are blocked. "
+            "If the task needs one, say so in your answer instead of attempting it."
         )
     return question
 
