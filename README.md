@@ -160,26 +160,27 @@ ai-room leave
 
 ```powershell
 ai-room ask --to claude --question "审查 OTA 升级风险" --related-doc Code/App/Code/app/Protocol/protocol_IoT.c
-ai-room ask --to codex --question "给这个函数加单测" --writable-doc tests/test_protocol.py
+ai-room ask --to codex --question "给这个函数加单测" --permission workspace-write
 ```
 
-- 默认只读：子 agent 被告知不得改文件、不得跑测试/构建。传 `--writable-doc EXACT_PATH` 才放开
-  只写这些文件；派发结束后 `workspace_guard` 会复核边界，越界改动记为 `guard-blocked`。
-- `--cwd` 决定针对哪个项目派发；子 agent 实际跑在从该路径解析出的房间根目录。
-- 退出码 0 = 成功且无越界；失败 / 超时 / 越界一律退出 3。超时也会先跑守卫复核、在台账留下
-  `timeout` 记录并带上越界文件。
+- 权限走档位 `--permission`，默认 `read-only`。`workspace-write` 允许子 agent 改文件、跑测试
+  和构建；`full-access` 解除沙箱。**派出去的是有手的工人，不是顾问**——顾问那套「只改指定文档、
+  不跑测试构建」的约束在这条路上不成立。
+- `--cwd` 决定针对哪个项目派发，并用各厂商的原生参数钉死（claude `--add-dir`、codex `-C`、
+  opencode `--dir`），不靠进程 cwd。opencode 尤其必须给：它**完全无视进程 cwd**，不给就会跑去
+  改它自己记着的上一个项目，且照样 exit 0。
+- 退出码 0 = 厂商自己说这一轮成功；失败和超时退 3。子 agent 改了哪些文件作为**回执**返回
+  （`changed_files` 和台账里的「改动回执」），只供复核，**不影响退出码**——派活时事先并不知道
+  它该动哪些文件，没有可越的界。
 - 台账写 `.ai-room/`，并自动生成 `.ai-room/.gitignore`（`*`）避免被提交进仓库。
 - 续接：`claude -r SESSION_ID`、`codex exec resume SESSION_ID`、`opencode run --session SESSION_ID`。
+  被外层掐死时 session id 也不会丢：输出是边跑边解析的，不等进程结束。
 
-ask 的边界复核与可见会话那条路是同一套机制，因此三条免责同样成立：
+回执有两条硬限制，别把它当沙箱：
 
-- **看不到谁改的**：`workspace_guard` 只看「变了什么」，看不出是子 agent、主聊还是你自己在同一
-  工作树里动了文件。
-- **不回滚**：越界改动是被记录并标记 `guard-blocked`，但文件原样留在盘上。退出码 3 不等于「这次
-  派发没生效」——子 agent 可能已经写完了，只是越界被拦在台账里。
-- **不覆盖不看**：守卫会盯着几乎所有文件（包括被 `.gitignore` 忽略的 `.env`、密钥、构建产物），
-  只显式排除 `.git/` 和 `.ai-room/`；但跑子 agent 的进程本身仍可能接触这些文件，守卫只是记录，
-  不代为清理。
+- **看不到 gitignore 里的东西**：回执是 `git status --porcelain` 的差集，被忽略的路径不出现。
+- **救不了跑错目录**：子 agent 要是整个跑在别的项目里，这里的回执是一片干净。边界只能靠工作
+  目录参数钉死，事后检测兜不住。
 
 ## 运行数据、恢复与并发
 
