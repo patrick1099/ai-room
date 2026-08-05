@@ -56,26 +56,44 @@ mailbox. It records the dispatch and the sub-agent session id in
 `<root>/.ai-room/ledger.md` so the turn can be resumed later.
 
 ```text
-ai-room ask --to claude|codex|opencode --question TEXT [--related-doc EXACT_PATH] [--writable-doc EXACT_PATH] [--model MODEL] [--cwd DIR] [--timeout SECONDS] [--permission-mode MODE] [--sandbox MODE] [--no-ledger]
+ai-room ask --to claude|codex|opencode --question TEXT [--permission read-only|workspace-write|full-access] [--related-doc EXACT_PATH] [--model MODEL] [--cwd DIR] [--timeout SECONDS] [--permission-mode MODE] [--sandbox MODE] [--no-ledger]
 ```
 
-- Default is read-only: the sub-agent is told not to modify files or run
-  tests/builds. Pass `--writable-doc EXACT_PATH` to grant write access to only
-  those files; the workspace guard re-checks the boundary after the turn.
-- `--cwd` selects which project to dispatch against; the sub-agent actually
-  runs in the room root resolved from that path.
-- Exit code 0 means the sub-agent succeeded and wrote nothing outside the
-  writable docs; any failure, timeout, or guard violation exits 3. A timeout
-  still runs the boundary check first and records any out-of-bound files.
-- The sub-agent session id is written to the ledger for `-r/--resume`
+- `--permission` is the tier, and it defaults to `read-only`. `workspace-write`
+  lets the sub-agent edit files and run commands in the working directory;
+  `full-access` lifts the sandbox. A dispatched sub-agent is a worker, not an
+  advisor: at `workspace-write` it may run tests and builds.
+- `--cwd` selects which project to dispatch against, and it is pinned with each
+  vendor's own flag. Do not rely on the shell's current directory.
+- Exit code 0 is the vendor's verdict: the sub-agent succeeded. Failures and
+  timeouts exit 3. Files the sub-agent changed are reported back in
+  `changed_files` and in the ledger as a receipt for review -- they never
+  change the exit code, because a dispatched job has no allow-list to violate.
+- The sub-agent session id is written to the ledger for resuming
   (`claude -r ID`, `codex exec resume ID`, `opencode run --session ID`).
 
-The workspace guard is best-effort, not a sandbox: it records which files
-changed, but cannot tell who changed them (the sub-agent, the primary, or you
-working in the same tree), and it never rolls anything back. It watches almost
-every file, including gitignored secrets and build outputs, and only explicitly
-excludes `.git/` and `.ai-room/`. Exit 3 means "out-of-bound write recorded",
-not "nothing happened".
+### `ask` blocks. Give it enough time.
+
+`ask` is synchronous and returns only when the sub-agent is done. A question
+takes tens of seconds; a real task takes minutes. **Your own shell tool's
+timeout is what kills it**, and the three of you have wildly different defaults:
+
+| you are | default shell timeout | what you must do |
+|---|---|---|
+| claude | ~600s | pass a larger `timeout` on the Bash call for long dispatches |
+| opencode | 120s | raise the global default with `OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS` |
+| codex | **10s** | you must pass `timeout_ms` explicitly on every call, or even a plain question is killed |
+
+If you need to keep working while it runs, do not expect `ask` to detach --
+it will not. Start your own subagent and have it make the blocking call.
+Delegation is not free: a trivial task costs two to three minutes of overhead,
+so dispatch a consultation synchronously and only delegate real work.
+
+The change receipt is not a sandbox. It reports what git sees in the
+sub-agent's working directory, so it misses gitignored paths, and it cannot
+tell you the job ran in the wrong project -- if the sub-agent worked somewhere
+else, the receipt is simply clean. Only the pinned working directory prevents
+that.
 
 ## Advisor boundary
 
