@@ -725,6 +725,10 @@ def _command_ask(
         root,
         (Path(value) for value in arguments.related_doc),
     )
+    # claude is the only vendor that lets the handle be chosen up front. Doing
+    # so means a run killed before it emits anything is still resumable, which
+    # codex and opencode cannot offer -- their ids only exist once they speak.
+    preassigned = str(uuid.uuid4()) if target == "claude" else None
     request = DriverRequest(
         question=arguments.question,
         cwd=root,
@@ -734,6 +738,7 @@ def _command_ask(
         permission_mode=arguments.permission_mode,
         sandbox=arguments.sandbox,
         related_docs=related_docs,
+        session_id=preassigned,
     )
     driver = driver_for(target)
     # The receipt is taken in the sub-agent's own working directory, not the
@@ -745,7 +750,10 @@ def _command_ask(
         result = driver.invoke(request)
     except DriverTimeout as error:
         # The turn was still paid for, so recover the session id from whatever
-        # the sub-agent emitted before it was killed.
+        # the sub-agent emitted before it was killed, falling back to the id we
+        # chose for it.  Only on this path: the process definitely ran, whereas
+        # a DriverError may mean the CLI never started, and recording a handle
+        # that resumes nothing is worse than recording none.
         _record_ledger(
             arguments,
             root,
@@ -754,7 +762,7 @@ def _command_ask(
             request,
             exit_code=-1,
             status="timeout",
-            session_id=session_id_from(error.stdout),
+            session_id=session_id_from(error.stdout) or preassigned,
             changed_files=changed_since(before, status_lines(workdir)),
             sender=sender,
         )

@@ -158,6 +158,41 @@ def test_ask_timeout_recovers_the_session_id_from_partial_output(
     assert "`timeout`" in ledger
 
 
+def test_ask_preassigns_a_session_id_for_claude(tmp_path: Path, monkeypatch) -> None:
+    """claude accepts a chosen handle, so use one -- it is the only vendor
+    whose run stays resumable even if it dies before saying anything."""
+    monkeypatch.chdir(tmp_path)
+    driver = _FakeDriver(_ok_result())
+    _run_ask(monkeypatch, driver=driver)
+    assert driver.request.session_id
+
+
+def test_ask_timeout_falls_back_to_the_preassigned_id(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A claude run killed before it emits anything is still resumable."""
+    monkeypatch.chdir(tmp_path)
+    driver = _RaisingDriver(DriverTimeout("timed out", stdout=""))
+    code, _, _ = _run_ask(monkeypatch, driver=driver)
+    assert code == EXIT_OPERATIONAL
+    ledger = _ledger(tmp_path)
+    assert "无会话 id" not in ledger
+    assert "claude -r " in ledger
+
+
+def test_ask_does_not_invent_an_id_when_the_cli_never_ran(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A handle that resumes nothing is worse than admitting there is none."""
+    from ai_room.drivers import DriverError
+
+    monkeypatch.chdir(tmp_path)
+    driver = _RaisingDriver(DriverError("claude CLI not found on PATH"))
+    code, _, _ = _run_ask(monkeypatch, driver=driver)
+    assert code == EXIT_OPERATIONAL
+    assert "unknown" in _ledger(tmp_path)
+
+
 def test_ask_reports_changed_files_without_failing_the_dispatch(
     tmp_path: Path, monkeypatch
 ) -> None:
