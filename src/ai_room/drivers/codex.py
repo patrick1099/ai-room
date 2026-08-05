@@ -16,6 +16,34 @@ _TIER_TO_SANDBOX = {
     "full-access": "danger-full-access",
 }
 
+#: codex's effective permission is not decided by ``-s`` alone.  An approving
+#: reviewer turns a sandbox denial into an escalation that runs *outside* the
+#: sandbox, so both axes must be set together and neither may be inherited from
+#: whatever the machine's config.toml happens to say.  Both directions were
+#: verified against the real CLI:
+#:
+#: - ``-s read-only`` on a machine configured with ``auto_review`` wrote both
+#:   files it was told it could not write.  Read-only is not a boundary while
+#:   approvals are on.
+#: - ``-s workspace-write`` with ``approval_policy=never`` produced a file the
+#:   caller could not read at all.  This machine's sandbox helper is broken, so
+#:   the sandboxed write failed and the fallback left the file owned by the
+#:   sandbox principal: exit 0, the receipt lists it, nobody can open it.
+#:   Permitting escalation is what makes the write land as a normal file.
+#:
+#: ``on-failure`` rather than ``on-request``: escalate only once the sandbox has
+#: actually refused, not whenever the model asks.
+_TIER_TO_APPROVAL = {
+    "read-only": ('approval_policy="never"',),
+    "workspace-write": (
+        'approval_policy="on-failure"',
+        "approvals_reviewer=auto_review",
+    ),
+    # danger-full-access has no sandbox to refuse anything, so there is nothing
+    # to escalate and no reason to leave approvals on.
+    "full-access": ('approval_policy="never"',),
+}
+
 
 class CodexDriver(Driver):
     name = "codex"
@@ -25,6 +53,8 @@ class CodexDriver(Driver):
         binary = find_binary(self.name, self._BINARY_CANDIDATES)
         sandbox_mode = request.sandbox or _TIER_TO_SANDBOX[request.permission]
         command = [binary, "exec", "--json", "-s", sandbox_mode]
+        for override in _TIER_TO_APPROVAL[request.permission]:
+            command += ["-c", override]
         command += ["-C", str(request.cwd)]
         for d in request.extra_dirs:
             command += ["--add-dir", d]

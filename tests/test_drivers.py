@@ -394,6 +394,63 @@ def test_codex_c_flag_pins_cwd(monkeypatch) -> None:
     assert _value_at(argv, "-C") == str(project)
 
 
+def test_codex_read_only_turns_approvals_off(monkeypatch) -> None:
+    """-s read-only is not a boundary on its own.
+
+    An approving reviewer escalates a sandbox denial into a run outside the
+    sandbox. Verified against the real CLI: with the machine configured for
+    auto_review, a read-only dispatch wrote both files it was told not to. The
+    driver therefore pins the approval policy instead of inheriting it.
+    """
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.codex",
+        CodexDriver(),
+        DriverRequest(question="q", cwd=Path(".")),
+    )
+    assert 'approval_policy="never"' in _all_values(argv, "-c")
+    assert "approvals_reviewer=auto_review" not in _all_values(argv, "-c")
+
+
+def test_codex_writable_allows_escalation_after_a_sandbox_refusal(
+    monkeypatch,
+) -> None:
+    """Without escalation a workspace-write produces files nobody can read.
+
+    When the sandbox helper is broken the sandboxed write fails and the
+    fallback leaves the file owned by the sandbox principal -- exit 0, and the
+    caller cannot open it. on-failure keeps the escalation narrow: only after
+    the sandbox has actually refused.
+    """
+    values = _all_values(
+        _capture_argv(
+            monkeypatch,
+            "ai_room.drivers.codex",
+            CodexDriver(),
+            DriverRequest(
+                question="q", cwd=Path("."), permission="workspace-write"
+            ),
+        ),
+        "-c",
+    )
+    assert 'approval_policy="on-failure"' in values
+    assert "approvals_reviewer=auto_review" in values
+
+
+def test_codex_full_access_needs_no_approvals(monkeypatch) -> None:
+    """danger-full-access has no sandbox to refuse anything to escalate past."""
+    values = _all_values(
+        _capture_argv(
+            monkeypatch,
+            "ai_room.drivers.codex",
+            CodexDriver(),
+            DriverRequest(question="q", cwd=Path("."), permission="full-access"),
+        ),
+        "-c",
+    )
+    assert 'approval_policy="never"' in values
+
+
 def test_codex_add_dir_for_extra_dirs(monkeypatch) -> None:
     argv = _capture_argv(
         monkeypatch,

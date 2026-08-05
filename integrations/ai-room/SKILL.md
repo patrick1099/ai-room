@@ -65,6 +65,12 @@ ai-room ask --to claude|codex|opencode --question TEXT [--permission read-only|w
   advisor: at `workspace-write` it may run tests and builds.
 - `--cwd` selects which project to dispatch against, and it is pinned with each
   vendor's own flag. Do not rely on the shell's current directory.
+- Tiers are set by `ask` itself and never inherited from the machine's vendor
+  config, because the same flags mean different things under different configs.
+  One caveat worth knowing: on codex, `workspace-write` permits a sandbox
+  refusal to be escalated into a run outside the sandbox. Without that a write
+  can land as a file the caller cannot read. So `workspace-write` on codex is
+  slightly wider than "confined to the working directory".
 - Exit code 0 is the vendor's verdict: the sub-agent succeeded. Failures and
   timeouts exit 3. Files the sub-agent changed are reported back in
   `changed_files` and in the ledger as a receipt for review -- they never
