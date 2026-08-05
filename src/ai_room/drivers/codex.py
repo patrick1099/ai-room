@@ -10,18 +10,24 @@ from .process import find_binary, run_cli
 from .protocol import Driver, DriverRequest, DriverResult, compose_prompt
 
 
+_TIER_TO_SANDBOX = {
+    "read-only": "read-only",
+    "workspace-write": "workspace-write",
+    "full-access": "danger-full-access",
+}
+
+
 class CodexDriver(Driver):
     name = "codex"
     _BINARY_CANDIDATES = ("codex", "codex.exe")
 
     def invoke(self, request: DriverRequest) -> DriverResult:
         binary = find_binary(self.name, self._BINARY_CANDIDATES)
-        # An explicit --sandbox always wins; otherwise read-only defaults to
-        # read-only and any writable grant defaults to workspace-write.
-        sandbox_mode = request.sandbox or (
-            "workspace-write" if not request.read_only else "read-only"
-        )
+        sandbox_mode = request.sandbox or _TIER_TO_SANDBOX[request.permission]
         command = [binary, "exec", "--json", "-s", sandbox_mode]
+        command += ["-C", str(request.cwd)]
+        for d in request.extra_dirs:
+            command += ["--add-dir", d]
         if request.model:
             command += ["-m", request.model]
         if not _is_git_repo(request.cwd):

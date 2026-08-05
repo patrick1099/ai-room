@@ -15,24 +15,34 @@ class ClaudeDriver(Driver):
 
     def invoke(self, request: DriverRequest) -> DriverResult:
         binary = find_binary(self.name, self._BINARY_CANDIDATES)
-        # An explicit --permission-mode always wins; otherwise read-only defaults
-        # to plan and any writable grant defaults to acceptEdits.
-        permission = request.permission_mode or (
-            "acceptEdits" if not request.read_only else "plan"
-        )
         command = [
             binary,
             "-p",
+            compose_prompt(request),
             "--output-format",
             "json",
-            "--permission-mode",
-            permission,
         ]
+        if request.permission == "full-access":
+            command += ["--dangerously-skip-permissions"]
+        else:
+            mode = request.permission_mode or (
+                "acceptEdits"
+                if request.permission == "workspace-write"
+                else "plan"
+            )
+            command += ["--permission-mode", mode]
         if not request.read_only:
-            command += ["--allowedTools", "Edit", "Write"]
+            command += ["--allowedTools", "Edit,Write"]
         if request.model:
             command += ["--model", request.model]
-        command.append(compose_prompt(request))
+        if request.session_id:
+            command += ["--session-id", request.session_id]
+        if request.agent_name:
+            command += ["--agent", request.agent_name]
+        command += ["--add-dir", str(request.cwd)]
+        if request.extra_dirs:
+            for d in request.extra_dirs:
+                command += ["--add-dir", str(d)]
 
         run = run_cli(command, cwd=request.cwd, timeout=request.timeout, agent=self.name)
         parsed = _parse_json(run.stdout)

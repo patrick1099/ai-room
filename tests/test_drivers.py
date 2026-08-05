@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 from ai_room.drivers.claude import ClaudeDriver, _parse_json
 from ai_room.drivers.codex import CodexDriver, _parse_jsonl as _parse_codex_jsonl
-from ai_room.drivers.opencode import OpenCodeDriver, _parse_jsonl as _parse_opencode_jsonl
+from ai_room.drivers.opencode import (
+    OpenCodeDriver,
+    _binary_command,
+    _parse_jsonl as _parse_opencode_jsonl,
+)
 from ai_room.drivers.protocol import (
     DriverError,
     DriverRequest,
@@ -132,7 +141,7 @@ def test_driver_request_read_only_defaults_true() -> None:
 
 
 def test_driver_request_read_only_false_with_writable() -> None:
-    request = DriverRequest(question="q", cwd=Path("."), writable_docs=("a.c",))
+    request = DriverRequest(question="q", cwd=Path("."), permission="workspace-write")
     assert request.read_only is False
 
 
@@ -148,16 +157,15 @@ def test_compose_prompt_read_only_bans_writes() -> None:
     assert "read-only" in prompt
 
 
-def test_compose_prompt_writable_lists_only_those_files() -> None:
+def test_compose_prompt_writable_omits_read_only_notice() -> None:
     request = DriverRequest(
         question="edit this",
         cwd=Path("."),
-        writable_docs=("a.c",),
+        permission="workspace-write",
     )
     prompt = compose_prompt(request)
-    assert "may write only these files" in prompt
-    assert "a.c" in prompt
     assert "read-only" not in prompt
+    assert prompt == "edit this"
 
 
 # --- argv-shape tests: each driver must build the exact vendor CLI contract. ---
@@ -196,6 +204,14 @@ def _value_at(argv: list[str], flag: str) -> str:
     return argv[argv.index(flag) + 1]
 
 
+def _all_values(argv: list[str], flag: str) -> list[str]:
+    """Return every value that follows *flag* in *argv* (for repeatable flags)."""
+    return [argv[i + 1] for i, a in enumerate(argv) if a == flag]
+
+
+# ---- claude ----
+
+
 def test_claude_argv_json_output_format(monkeypatch) -> None:
     argv = _capture_argv(
         monkeypatch,
@@ -203,7 +219,26 @@ def test_claude_argv_json_output_format(monkeypatch) -> None:
         ClaudeDriver(),
         DriverRequest(question="q", cwd=Path(".")),
     )
-    assert argv[:6] == ["binary", "-p", "--output-format", "json", "--permission-mode", "plan"]
+    assert argv[0] == "binary"
+    assert argv[1] == "-p"
+    assert _value_at(argv, "--output-format") == "json"
+
+
+def test_claude_prompt_is_value_of_p_not_trailing(monkeypatch) -> None:
+    """The prompt must be the value of -p, not the last positional arg.
+
+    --allowedTools is variadic and would eat a trailing prompt as a tool name.
+    """
+    request = DriverRequest(question="do stuff", cwd=Path("."))
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.claude",
+        ClaudeDriver(),
+        request,
+    )
+    assert argv[1] == "-p"
+    assert argv[2] == compose_prompt(request)
+    assert argv[-1] != compose_prompt(request)
 
 
 def test_claude_read_only_defaults_plan(monkeypatch) -> None:
@@ -222,10 +257,22 @@ def test_claude_writable_defaults_accept_edits(monkeypatch) -> None:
         monkeypatch,
         "ai_room.drivers.claude",
         ClaudeDriver(),
-        DriverRequest(question="q", cwd=Path("."), writable_docs=("a.c",)),
+        DriverRequest(question="q", cwd=Path("."), permission="workspace-write"),
     )
     assert _value_at(argv, "--permission-mode") == "acceptEdits"
     assert "--allowedTools" in argv
+    assert _value_at(argv, "--allowedTools") == "Edit,Write"
+
+
+def test_claude_full_access_emits_dangerously_skip(monkeypatch) -> None:
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.claude",
+        ClaudeDriver(),
+        DriverRequest(question="q", cwd=Path("."), permission="full-access"),
+    )
+    assert "--dangerously-skip-permissions" in argv
+    assert "--permission-mode" not in argv
 
 
 def test_claude_explicit_permission_always_wins(monkeypatch) -> None:
@@ -236,6 +283,53 @@ def test_claude_explicit_permission_always_wins(monkeypatch) -> None:
         DriverRequest(question="q", cwd=Path("."), permission_mode="bypassPermissions"),
     )
     assert _value_at(argv, "--permission-mode") == "bypassPermissions"
+
+
+def test_claude_add_dir_for_cwd(monkeypatch) -> None:
+    project = Path("/tmp/project")
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.claude",
+        ClaudeDriver(),
+        DriverRequest(question="q", cwd=project),
+    )
+    assert str(project) in _all_values(argv, "--add-dir")
+
+
+def test_claude_add_dir_for_extra_dirs(monkeypatch) -> None:
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.claude",
+        ClaudeDriver(),
+        DriverRequest(
+            question="q",
+            cwd=Path("."),
+            permission="workspace-write",
+            extra_dirs=("/a", "/b"),
+        ),
+    )
+    assert _all_values(argv, "--add-dir")[-2:] == ["/a", "/b"]
+
+
+def test_claude_model_session_id_agent(monkeypatch) -> None:
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.claude",
+        ClaudeDriver(),
+        DriverRequest(
+            question="q",
+            cwd=Path("."),
+            model="claude-3",
+            session_id="sess-123",
+            agent_name="builder",
+        ),
+    )
+    assert _value_at(argv, "--model") == "claude-3"
+    assert _value_at(argv, "--session-id") == "sess-123"
+    assert _value_at(argv, "--agent") == "builder"
+
+
+# ---- codex ----
 
 
 def test_codex_argv_exec_json(monkeypatch) -> None:
@@ -263,9 +357,19 @@ def test_codex_writable_defaults_workspace_write(monkeypatch) -> None:
         monkeypatch,
         "ai_room.drivers.codex",
         CodexDriver(),
-        DriverRequest(question="q", cwd=Path("."), writable_docs=("a.c",)),
+        DriverRequest(question="q", cwd=Path("."), permission="workspace-write"),
     )
     assert argv[4] == "workspace-write"
+
+
+def test_codex_full_access_sandbox(monkeypatch) -> None:
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.codex",
+        CodexDriver(),
+        DriverRequest(question="q", cwd=Path("."), permission="full-access"),
+    )
+    assert argv[4] == "danger-full-access"
 
 
 def test_codex_explicit_sandbox_always_wins(monkeypatch) -> None:
@@ -276,6 +380,46 @@ def test_codex_explicit_sandbox_always_wins(monkeypatch) -> None:
         DriverRequest(question="q", cwd=Path("."), sandbox="danger-full-access"),
     )
     assert argv[4] == "danger-full-access"
+
+
+def test_codex_c_flag_pins_cwd(monkeypatch) -> None:
+    project = Path("/tmp/project")
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.codex",
+        CodexDriver(),
+        DriverRequest(question="q", cwd=project),
+    )
+    assert "-C" in argv
+    assert _value_at(argv, "-C") == str(project)
+
+
+def test_codex_add_dir_for_extra_dirs(monkeypatch) -> None:
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.codex",
+        CodexDriver(),
+        DriverRequest(
+            question="q",
+            cwd=Path("."),
+            permission="workspace-write",
+            extra_dirs=("/a", "/b"),
+        ),
+    )
+    assert _all_values(argv, "--add-dir") == ["/a", "/b"]
+
+
+def test_codex_model_flag(monkeypatch) -> None:
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.codex",
+        CodexDriver(),
+        DriverRequest(question="q", cwd=Path("."), model="gpt-5"),
+    )
+    assert _value_at(argv, "-m") == "gpt-5"
+
+
+# ---- opencode ----
 
 
 def test_opencode_argv_run_format_json(monkeypatch) -> None:
@@ -296,3 +440,132 @@ def test_opencode_read_only_uses_plan_agent(monkeypatch) -> None:
         DriverRequest(question="q", cwd=Path(".")),
     )
     assert _value_at(argv, "--agent") == "plan"
+
+
+def test_opencode_dir_present_read_only(monkeypatch) -> None:
+    project = Path("/tmp/project")
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.opencode",
+        OpenCodeDriver(),
+        DriverRequest(question="q", cwd=project),
+    )
+    assert "--dir" in argv
+    assert _value_at(argv, "--dir") == str(project)
+
+
+def test_opencode_dir_present_workspace_write(monkeypatch) -> None:
+    project = Path("/tmp/project")
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.opencode",
+        OpenCodeDriver(),
+        DriverRequest(question="q", cwd=project, permission="workspace-write"),
+    )
+    assert _value_at(argv, "--dir") == str(project)
+    assert "--auto" in argv
+
+
+def test_opencode_dir_present_full_access(monkeypatch) -> None:
+    project = Path("/tmp/project")
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.opencode",
+        OpenCodeDriver(),
+        DriverRequest(question="q", cwd=project, permission="full-access"),
+    )
+    assert _value_at(argv, "--dir") == str(project)
+    assert "--auto" in argv
+
+
+def test_opencode_agent_name_overrides_plan(monkeypatch) -> None:
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.opencode",
+        OpenCodeDriver(),
+        DriverRequest(question="q", cwd=Path("."), agent_name="builder"),
+    )
+    assert _value_at(argv, "--agent") == "builder"
+
+
+def test_opencode_agent_name_does_not_cost_write_access(monkeypatch) -> None:
+    """Naming an agent says who does the work, not how much they may do.
+
+    --agent and --auto answer different questions, so a workspace-write
+    dispatch that also names an agent must still receive --auto.
+    """
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.opencode",
+        OpenCodeDriver(),
+        DriverRequest(
+            question="q",
+            cwd=Path("."),
+            permission="workspace-write",
+            agent_name="builder",
+        ),
+    )
+    assert _value_at(argv, "--agent") == "builder"
+    assert "--auto" in argv
+
+
+def test_binary_command_passes_a_real_executable_through() -> None:
+    assert _binary_command(r"C:\tools\opencode.exe") == [r"C:\tools\opencode.exe"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="npm shim resolution is Windows-only")
+def test_binary_command_resolves_an_npm_shim_to_the_real_exe(tmp_path: Path) -> None:
+    """The shim must be bypassed, not invoked through cmd.
+
+    Launching the .cmd via ``cmd /c`` truncates the prompt at its first
+    newline, so this is a correctness fix, not a tidiness one.
+    """
+    shim = tmp_path / "opencode.cmd"
+    shim.write_text('@ECHO off\r\n"%dp0%\\node_modules\\x" %*\r\n', encoding="utf-8")
+    real = tmp_path / "node_modules" / "opencode-ai" / "bin" / "opencode.exe"
+    real.parent.mkdir(parents=True)
+    real.write_bytes(b"MZ")
+
+    assert _binary_command(str(shim)) == [str(real)]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="npm shim resolution is Windows-only")
+def test_binary_command_reads_the_target_out_of_an_unfamiliar_shim(
+    tmp_path: Path,
+) -> None:
+    real = tmp_path / "elsewhere.exe"
+    real.write_bytes(b"MZ")
+    shim = tmp_path / "opencode.cmd"
+    shim.write_text(f'@ECHO off\r\n"{real}" %*\r\n', encoding="utf-8")
+
+    assert _binary_command(str(shim)) == [str(real)]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="cmd.exe argument parsing is Windows-only")
+def test_cmd_shim_would_have_truncated_a_multiline_prompt() -> None:
+    """Pins the reason the shim is bypassed, so nobody reinstates ``cmd /c``.
+
+    Every real prompt is multi-line -- compose_prompt appends a block -- and
+    the truncated run still exits 0 with a plausible answer, which is why this
+    went unnoticed.
+    """
+    show = [sys.executable, "-c", "import sys; print(repr(sys.argv[1]))"]
+    prompt = "line one\nline two"
+
+    direct = subprocess.run(show + [prompt], capture_output=True, text=True)
+    through_cmd = subprocess.run(
+        ["cmd", "/c"] + show + [prompt], capture_output=True, text=True
+    )
+
+    assert "line two" in direct.stdout
+    assert "line two" not in through_cmd.stdout
+
+
+def test_opencode_model_flag(monkeypatch) -> None:
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.opencode",
+        OpenCodeDriver(),
+        DriverRequest(question="q", cwd=Path("."), model="opencode-1"),
+    )
+    assert _value_at(argv, "--model") == "opencode-1"
