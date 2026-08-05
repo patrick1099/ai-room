@@ -61,7 +61,12 @@ def test_resume_hint_codex_is_subcommand(tmp_path: Path) -> None:
     assert "\u7eed\u63a5: `codex exec resume thr-1`" in content
 
 
-def test_append_ledger_records_violations(tmp_path: Path) -> None:
+def test_append_ledger_records_the_change_receipt(tmp_path: Path) -> None:
+    """The files a dispatch touched are recorded, under a successful status.
+
+    Changed files are information for the caller, not a verdict, so they must
+    appear on an ``ok`` entry just the same.
+    """
     entry = LedgerEntry(
         agent="claude",
         question="question",
@@ -69,13 +74,13 @@ def test_append_ledger_records_violations(tmp_path: Path) -> None:
         related_docs=(),
         model=None,
         exit_code=0,
-        status="guard-blocked",
+        status="ok",
         timestamp="2026-08-04T14:00:00+08:00",
-        violations=("secret.txt", "other.txt"),
+        changed_files=(" M src/main.c", "?? notes.txt"),
     )
     path = append_ledger(tmp_path, entry)
     content = path.read_text(encoding="utf-8")
-    assert "\u8d8a\u754c\u6587\u4ef6: secret.txt, other.txt" in content
+    assert "\u6539\u52a8\u56de\u6267:  M src/main.c, ?? notes.txt" in content
 
 
 def test_append_ledger_records_sender(tmp_path: Path) -> None:

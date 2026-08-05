@@ -36,7 +36,9 @@ class LedgerEntry:
     exit_code: int
     status: str
     timestamp: str | None = None
-    violations: tuple[str, ...] = ()
+    #: The dispatch receipt: which files the sub-agent moved.  Recorded for
+    #: review, never for enforcement -- see :mod:`ai_room.receipt`.
+    changed_files: tuple[str, ...] = ()
     sender: str | None = None
     is_error: bool | None = None
     subtype: str | None = None
@@ -126,9 +128,9 @@ def _format_entry(entry: LedgerEntry) -> str:
         lines.append(f"- \u8d39\u7528: ${cost} USD, {turns} turn(s)")
     if entry.usage:
         lines.append(f"- usage: {_single_line_json(entry.usage)}")
-    if entry.violations:
+    if entry.changed_files:
         lines.append(
-            f"- \u8d8a\u754c\u6587\u4ef6: {', '.join(entry.violations)}"
+            f"- \u6539\u52a8\u56de\u6267: {', '.join(entry.changed_files)}"
         )
     return "\n".join(lines) + "\n"
 

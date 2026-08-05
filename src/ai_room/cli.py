@@ -39,9 +39,17 @@ from .domain import (
     TaskRequest,
     TaskView,
 )
-from .drivers import DriverError, DriverRequest, DriverTimeout, driver_for
+from .drivers import (
+    PERMISSION_TIERS,
+    DriverError,
+    DriverRequest,
+    DriverTimeout,
+    driver_for,
+    session_id_from,
+)
 from .ledger import LedgerEntry, append_ledger
 from .paths import normalize_root, resolve_room, runtime_root
+from .receipt import changed_since, status_lines
 from .service import AiRoomService
 from .storage import (
     DatabaseBusyError,
@@ -200,10 +208,14 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="EXACT_PATH",
     )
     ask.add_argument(
-        "--writable-doc",
-        action="append",
-        default=[],
-        metavar="EXACT_PATH",
+        "--permission",
+        choices=PERMISSION_TIERS,
+        default="read-only",
+        help=(
+            "how much the sub-agent may do: read-only (default), "
+            "workspace-write (edit files and run commands in the working "
+            "directory), or full-access (no sandbox)"
+        ),
     )
     ask.add_argument("--model", metavar="MODEL")
     ask.add_argument("--cwd", metavar="DIR", help="which project to dispatch against; the sub-agent runs in the room root selected by this path")
@@ -713,28 +725,27 @@ def _command_ask(
         root,
         (Path(value) for value in arguments.related_doc),
     )
-    writable_docs = normalize_exact_paths(
-        root,
-        (Path(value) for value in arguments.writable_doc),
-    )
     request = DriverRequest(
         question=arguments.question,
         cwd=root,
+        permission=arguments.permission,
         model=arguments.model,
         timeout=arguments.timeout,
         permission_mode=arguments.permission_mode,
         sandbox=arguments.sandbox,
         related_docs=related_docs,
-        writable_docs=writable_docs,
     )
     driver = driver_for(target)
-    before = capture_workspace(root)
+    # The receipt is taken in the sub-agent's own working directory, not the
+    # room root: reporting on a directory the work never happened in is worse
+    # than reporting nothing.
+    workdir = request.cwd
+    before = status_lines(workdir)
     try:
         result = driver.invoke(request)
-    except DriverTimeout:
-        violations = _capture_violations_after(
-            root, before, writable_docs
-        )
+    except DriverTimeout as error:
+        # The turn was still paid for, so recover the session id from whatever
+        # the sub-agent emitted before it was killed.
         _record_ledger(
             arguments,
             root,
@@ -743,15 +754,12 @@ def _command_ask(
             request,
             exit_code=-1,
             status="timeout",
-            session_id=None,
-            violations=violations,
+            session_id=session_id_from(error.stdout),
+            changed_files=changed_since(before, status_lines(workdir)),
             sender=sender,
         )
         raise
     except DriverError:
-        violations = _capture_violations_after(
-            root, before, writable_docs
-        )
         _record_ledger(
             arguments,
             root,
@@ -761,36 +769,13 @@ def _command_ask(
             exit_code=-1,
             status="error",
             session_id=None,
-            violations=violations,
+            changed_files=changed_since(before, status_lines(workdir)),
             sender=sender,
         )
         raise
 
-    # The sub-agent already ran and its session id is in hand; only the
-    # after-capture can raise WorkspaceCaptureError here, so the ledger must
-    # keep the real session id instead of None.
-    try:
-        after = capture_workspace(root)
-        guard = compare_workspace(before, after, writable_docs)
-    except WorkspaceCaptureError:
-        _record_ledger(
-            arguments,
-            root,
-            target,
-            related_docs,
-            request,
-            exit_code=result.exit_code,
-            status="capture-error",
-            session_id=result.session_id,
-            violations=(),
-            sender=sender,
-            result=result,
-        )
-        raise
-
+    changed = changed_since(before, status_lines(workdir))
     status = "ok" if result.ok else "error"
-    if guard.violations:
-        status = "guard-blocked"
     ledger_path = _record_ledger(
         arguments,
         root,
@@ -800,41 +785,21 @@ def _command_ask(
         exit_code=result.exit_code,
         status=status,
         session_id=result.session_id,
-        violations=guard.violations,
+        changed_files=changed,
         sender=sender,
         result=result,
     )
-    ok = result.ok and not guard.violations
     return {
-        "ok": ok,
+        "ok": result.ok,
         "agent": target,
         "sender": None if sender is None else sender.value,
         "session_id": result.session_id,
         "exit_code": result.exit_code,
         "text": result.text,
         "stderr": result.stderr,
-        "guard_violations": list(guard.violations),
+        "changed_files": list(changed),
         "ledger": None if ledger_path is None else str(ledger_path),
     }
-
-
-def _capture_violations_after(
-    root: Path,
-    before,
-    writable_docs: tuple[str, ...],
-) -> tuple[str, ...]:
-    """Compare the workspace after an interrupted run, best-effort.
-
-    Called from the timeout/error branches so a half-finished sub-agent's
-    out-of-bound writes are still recorded.  A failed capture is swallowed
-    (returns empty) so the original error still propagates.
-    """
-    try:
-        after = capture_workspace(root)
-        guard = compare_workspace(before, after, writable_docs)
-    except WorkspaceCaptureError:
-        return ()
-    return guard.violations
 
 
 def _record_ledger(
@@ -847,7 +812,7 @@ def _record_ledger(
     exit_code: int,
     status: str,
     session_id: str | None,
-    violations: tuple[str, ...],
+    changed_files: tuple[str, ...],
     sender: str | None = None,
     result: DriverResult | None = None,
 ) -> Path | None:
@@ -864,7 +829,7 @@ def _record_ledger(
             model=request.model,
             exit_code=exit_code,
             status=status,
-            violations=violations,
+            changed_files=changed_files,
             sender=sender,
             is_error=None if result is None else result.is_error,
             subtype=None if result is None else result.subtype,

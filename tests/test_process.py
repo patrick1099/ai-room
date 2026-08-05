@@ -54,6 +54,88 @@ def test_run_cli_times_out(tmp_path: Path) -> None:
         run_cli([sys.executable, str(script)], cwd=tmp_path, timeout=0.3, agent="test")
 
 
+def _slow_talker(tmp_path: Path) -> Path:
+    """A child that speaks once, then outlives any sane timeout."""
+    script = tmp_path / "slow.py"
+    script.write_text(
+        "import sys, time\n"
+        "print('{\"thread_id\": \"abc-123\"}', flush=True)\n"
+        "time.sleep(30)\n"
+        "print('never', flush=True)\n",
+        encoding="utf-8",
+    )
+    return script
+
+
+def test_on_line_fires_while_the_child_is_still_running(tmp_path: Path) -> None:
+    """The session id must be recoverable from a run that never finishes.
+
+    This is the whole point of streaming: the caller's shell can kill ask long
+    before the sub-agent is done, and the id of the turn already paid for has
+    to have reached us by then.
+    """
+    seen: list[str] = []
+    with pytest.raises(DriverTimeout):
+        run_cli(
+            [sys.executable, str(_slow_talker(tmp_path))],
+            cwd=tmp_path,
+            timeout=1.5,
+            agent="test",
+            on_line=seen.append,
+        )
+    assert any("abc-123" in line for line in seen)
+
+
+def test_timeout_carries_the_partial_output(tmp_path: Path) -> None:
+    with pytest.raises(DriverTimeout) as caught:
+        run_cli(
+            [sys.executable, str(_slow_talker(tmp_path))],
+            cwd=tmp_path,
+            timeout=1.5,
+            agent="test",
+        )
+    assert "abc-123" in caught.value.stdout
+
+
+def test_failing_callback_is_reported_but_does_not_abort_the_run(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "chatty.py"
+    script.write_text(
+        "print('one')\nprint('two')\n",
+        encoding="utf-8",
+    )
+
+    def explode(_line: str) -> None:
+        raise RuntimeError("ledger is on fire")
+
+    run = run_cli(
+        [sys.executable, str(script)],
+        cwd=tmp_path,
+        timeout=30,
+        agent="test",
+        on_line=explode,
+    )
+    assert run.returncode == 0
+    assert "two" in run.stdout
+    assert isinstance(run.callback_error, RuntimeError)
+
+
+def test_large_stderr_does_not_deadlock(tmp_path: Path) -> None:
+    """Both pipes are drained concurrently, so a noisy stderr cannot wedge us."""
+    script = tmp_path / "noisy.py"
+    script.write_text(
+        "import sys\n"
+        "for i in range(4000):\n"
+        "    sys.stderr.write('warning %d: something happened\\n' % i)\n"
+        "sys.stdout.write('done\\n')\n",
+        encoding="utf-8",
+    )
+    run = run_cli([sys.executable, str(script)], cwd=tmp_path, timeout=60, agent="test")
+    assert run.stdout.strip() == "done"
+    assert run.stderr.count("warning") == 4000
+
+
 def test_run_cli_missing_executable_raises_driver_error(tmp_path: Path) -> None:
     with pytest.raises(DriverError):
         run_cli(
