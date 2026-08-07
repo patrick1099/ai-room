@@ -118,6 +118,9 @@ def test_shared_skill_contains_the_role_and_compaction_contract() -> None:
     # The advisor boundary is the one thing a reader must not be able to miss.
     assert "绝不改源码" in text
     assert "绝不替主聊跑测试、构建、部署或任何真实操作" in text
+    # `ask` is the default and the mailbox is opt-in.  Lose this and the model
+    # goes back to asking the user to open a second window for a one-command job.
+    assert "默认走 `ask`" in text
 
 
 def test_shared_skill_routes_to_one_manual_per_vendor() -> None:
@@ -127,14 +130,26 @@ def test_shared_skill_routes_to_one_manual_per_vendor() -> None:
     nothing, and the vendor that reads it silently loses its whole contract.
     """
     text = SOURCE_SKILL.read_text(encoding="utf-8")
-    # Each manual must carry the two things that vendor gets wrong without it:
-    # how it is identified, and the shell timeout that silently kills `ask`.
+    # Each manual must carry the three things that vendor gets wrong without
+    # it: that `ask` is the default, how it is identified, and the shell
+    # timeout that silently kills a blocking `ask`.
     manuals = {
-        "claude-code.md": ("AI_ROOM_CLAUDE_SESSION_ID", "ai-room wait", "600"),
-        "codex.md": ("CODEX_THREAD_ID", "ai-room wait", "timeout_ms"),
+        "claude-code.md": (
+            "默认用 `ask`",
+            "AI_ROOM_CLAUDE_SESSION_ID",
+            "ai-room wait",
+            "600",
+        ),
+        "codex.md": (
+            "默认用 `ask`",
+            "CODEX_THREAD_ID",
+            "ai-room wait",
+            "timeout_ms",
+        ),
         # opencode has no mailbox identity at all, so its manual must say so
         # rather than describe a protocol it cannot join.
         "opencode.md": (
+            "默认路径",
             "只能用 `ask`",
             "invalid choice: 'opencode'",
             "OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS",

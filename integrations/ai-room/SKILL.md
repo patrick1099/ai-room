@@ -1,28 +1,35 @@
 ---
 name: ai-room
-description: 用本机 ai-room CLI 在 Claude Code / Codex / opencode 之间互相咨询和派活——两个可见窗口走信箱互当顾问(join/wait/send/reply)，或用 ask 无头派发一次性子 agent 去干活。当用户说"问问另一个 AI""让 codex/claude 看一下""派个子 agent 去做""opencode 跑一下"，或主聊窗口接近上下文上限需要对方确认压缩安全节点时使用。三方能力不同：opencode 只能用 ask，不能加入信箱。
+description: 用本机 ai-room CLI 把活派给另一个 AI（Claude Code / Codex / opencode）。**默认走 `ask` 无头模式**：一条命令派一个一次性子 agent 去咨询或干活，不需要用户开第二个窗口，问完即返回。当用户说"问问另一个 AI""让 codex/claude 看一下""派个子 agent 去做""opencode 跑一下"，或你需要另一个模型的独立判断时用它。只有用户明确要求"开两个窗口互当顾问 / 走信箱 / join 房间"时，才改用 join/wait/send/reply 的对话模式（且 opencode 不支持那个模式）。
 ---
 
 # ai-room
 
 本机 CLI，命令名 `ai-room`（等价 `python -m ai_room`）。每条命令输出**一行 JSON**，成功是 `{"ok":true,...}`。退出码：`0` 成功、`2` 参数错、`3` 运行或业务失败、`130` 被中断。
 
-## 它提供两件互不相干的能力
+## 默认走 `ask`，别问用户要不要开窗口
 
-| | 能力 A：信箱顾问 | 能力 B：`ask` 无头派发 |
+它提供两件互不相干的能力，**默认永远是 B**：
+
+| | **能力 B：`ask` 无头派发（默认）** | 能力 A：信箱顾问（要用户明确要求） |
 |---|---|---|
-| 是什么 | 两个**用户亲手打开的可见窗口**互相咨询，谁在服务用户谁是主聊，另一边是本次顾问 | 派一个**一次性子 agent** 去干活，不需要窗口、不进信箱 |
-| 命令 | `join` `wait` `send` `reply` `status` `leave` | `ask` |
-| 谁能用 | **只有 codex 和 claude** | 三方都能**调用**；claude / codex / opencode 都能当**目标** |
-| 对方是 | 顾问，只出意见和改指定文档 | 工人，`workspace-write` 档位下会改文件、跑测试构建 |
+| 是什么 | 一条命令派一个**一次性子 agent** 去咨询或干活，不需要窗口、不进信箱，跑完即返回 | 两个**用户亲手打开的可见窗口**互相咨询，谁在服务用户谁是主聊，另一边是本次顾问 |
+| 命令 | `ask` | `join` `wait` `send` `reply` `status` `leave` |
+| 谁能用 | 三方都能**调用**；claude / codex / opencode 都能当**目标** | **只有 codex 和 claude** |
+| 对方是 | 工人，`workspace-write` 档位下会改文件、跑测试构建 | 顾问，只出意见和改指定文档 |
+| 前置条件 | **无。** 直接跑就行 | 用户已经亲手开好两个窗口并各自 `join` 过 |
+
+**判定规则，只有一条**：用户没有明确说要"开两个窗口 / 走信箱 / 让另一个 AI 加入房间 / join"，就用 `ask`。需要另一个模型的意见时直接派发，**不要反问用户"要不要开一个 codex 窗口"**——那是在把一件一条命令能办的事变成一次协商。
+
+只在这些情况下才走能力 A：用户明说要对话模式；或者两个窗口已经在跑（`ai-room status` 显示对方 `waiting`）；或者主聊接近上下文上限、需要对方确认压缩安全节点（那件事本身依赖两边都在线）。
 
 ## 先认领身份，再读你自己那一份
 
 | 你是 | 读同目录下的 | 你能用 |
 |---|---|---|
-| Claude Code | `claude-code.md` | A + B |
-| Codex | `codex.md` | A + B |
-| opencode | `opencode.md` | **只有 B** |
+| Claude Code | `claude-code.md` | 默认 `ask`；用户点名要对话模式时才走信箱 |
+| Codex | `codex.md` | 默认 `ask`；用户点名要对话模式时才走信箱 |
+| opencode | `opencode.md` | **只有 `ask`**，信箱模式加不进去 |
 
 这三份文件就在本 skill 目录里，和 SKILL.md 同级。**只读你自己那一份。** 三方的可用命令、身份探测方式和 shell 默认超时都不一样，照抄别人的会直接报错。
 
@@ -36,7 +43,7 @@ description: 用本机 ai-room CLI 在 Claude Code / Codex / opencode 之间互�
 4. **`ask` 的 `changed_files` 回执不是沙箱。** 它是 `git status --porcelain` 的前后差集：看不见 gitignore 里的东西，也救不了跑错项目——子 agent 整个跑在别的仓库时，回执是一片干净。边界只能靠工作目录参数**事先**钉死，事后检测兜不住。
 5. **一次只问一个具体问题**，外加回答它所需要的每一条精确路径。永远不要让对方"全面 review 一下"。
 
-## `ask` 命令形（三方通用）
+## `ask` 命令形（默认模式，三方通用）
 
 ```text
 ai-room ask --to claude|codex|opencode --question TEXT
@@ -53,7 +60,7 @@ ai-room ask --to claude|codex|opencode --question TEXT
 - 退出码 0 表示厂商自己判定这一轮成功；失败和超时退 3。`changed_files` 是**回执**，只供复核，不影响退出码——派活时本来就不知道它该动哪些文件，没有可越的界。
 - 台账写在 `<工作树根>/.ai-room/ledger.md`，含子 agent 的 **session id** 供续接，并自动生成 `.ai-room/.gitignore`（内容 `*`）避免进仓库。`--no-ledger` 关闭。
 
-## 能力 A 的信箱协议（codex 和 claude 适用，**opencode 跳过本节**）
+## 能力 A 的信箱协议（**非默认**，用户点名才走；codex 和 claude 适用，**opencode 跳过本节**）
 
 ```text
 ai-room join codex [--room NAME]
