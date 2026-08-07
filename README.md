@@ -24,8 +24,12 @@
 毛病）；**② 派 opencode 执行**（`--to opencode --permission workspace-write`，交上去的是一件
 边界清楚、完成标准明确的任务）。
 
-**硬顺序：先咨询，后执行。** 任何要交给 opencode 的任务，派之前必须先让决策者过一遍方案，
-否则就是让一个没有决策权的执行者去执行一个没人审过的方案。
+**opencode 是廉价劳力，机械活随便派、鼓励派**：批量改名、跑格式化、加日志、补样板代码、跑测试
+并摘出失败、改错别字。这类活没有方案可审，直接派。
+
+**有技术取舍时才走「先咨询，后执行」**，而且门槛是**方案级**的一次，不是每件任务都重审：
+opencode 不许执行没人审过的方案，但方案定稿后拆出来的多件任务直接派。判定只有一句——
+**这件事有没有技术取舍？** 没有就直接派。
 
 两种用法都必须把**场景上下文**说全——子 agent 是零上下文的，它不知道你在做什么项目。
 
@@ -72,21 +76,6 @@ python -m ai_room.install --check
 拒绝写入——本机若用 symlink 把这两个位置指到别处（例如 hub 金库），`--check` 会明确报
 `installation ancestor is not a directory`，这是有意为之：不穿过 symlink 覆盖别人管理的目录。
 
-## skill 的四个文件
-
-`SKILL.md` 是**路由**，不是全文：它讲三方共有的部分（两种能力、五条铁律、`ask` 命令形、信箱
-协议），然后按身份把读者分流到三份 vendor 手册。三方能力并不相同：
-
-| 读者 | 手册 | 能用 |
-|---|---|---|
-| Claude Code | `claude-code.md` | 信箱顾问 + `ask` |
-| Codex | `codex.md` | 信箱顾问 + `ask` |
-| opencode | `opencode.md` | **只有 `ask`** —— `AgentName` 里没有 opencode，也没有它的会话探测器，`join`/`wait`/`send`/`reply`/`status` 一律失败 |
-
-每份手册只写该 vendor 特有的机制：身份从哪个环境变量来、它自己的 shell 默认超时（claude ~600s、
-opencode 120s、codex **10s**）怎么和阻塞的 `ask`/`wait` 配合、以及它作为 `ask` 目标时的档位映射。
-共有的合同只在 `SKILL.md` 写一遍，手册不复述，避免四份文档互相漂移。
-
 只有用户看过预演并明确批准真实安装后，才可单独执行：
 
 ```powershell
@@ -96,6 +85,21 @@ python -m ai_room.install --apply
 
 不要把 `--apply` 混进日常自动测试或文档验收。安装器只合并 ai-room 的 Claude `SessionStart`
 hook；遇到已有冲突文件、异常 JSON 结构或不安全目标会拒绝写入。
+
+## skill 的四个文件
+
+`SKILL.md` 是**路由**，不是全文：它讲三方共有的部分（三个角色、`ask` 两种用法、先咨询后执行、
+五条铁律、命令形、信箱协议），然后按身份把读者分流到三份 vendor 手册。三方角色并不相同：
+
+| 读者 | 手册 | 角色与能力 |
+|---|---|---|
+| Claude Code | `claude-code.md` | 咨询者/决策者。主聊时咨询 codex、派 opencode 执行；也能走信箱 |
+| Codex | `codex.md` | 咨询者/决策者。主聊时咨询 claude、派 opencode 执行；也能走信箱 |
+| opencode | `opencode.md` | **执行者，只有 `ask`** —— `AgentName` 里没有 opencode，也没有它的会话探测器，`join`/`wait`/`send`/`reply`/`status` 一律失败 |
+
+每份手册只写该 vendor 特有的机制：身份从哪个环境变量来、它自己的 shell 默认超时（claude ~600s、
+opencode 120s、codex **10s**）怎么和阻塞的 `ask`/`wait` 配合、以及它作为 `ask` 目标时的档位映射。
+共有的合同只在 `SKILL.md` 写一遍，手册不复述，避免四份文档互相漂移。
 
 ## 启动两个窗口（非默认，用户点名要对话模式时才做）
 
@@ -220,8 +224,9 @@ ai-room ask --to opencode --permission workspace-write --related-doc Code/App/Co
   写权限就是角色串岗。只有派 opencode 执行时才用 `workspace-write`（改文件、跑测试和构建），
   `full-access` 解除沙箱。**派给 opencode 的是有手的工人，不是顾问**——顾问那套「只改指定
   文档、不跑测试构建」的约束在这条路上不成立。
-- 派 opencode 之前**必须先让决策者过一遍方案**。这条顺序 CLI 不强制，靠 skill 里的约定；
-  跳过它就是让一个没有决策权的执行者去执行一个没人审过的方案。
+- **有技术取舍**的活，派 opencode 之前必须先让决策者过一遍方案；机械活直接派，不用问任何人。
+  这条顺序 CLI 不强制，靠 skill 里的约定。审几次由上层工作流定——vibe-flow 按档位分（省档
+  不咨询、好档审方案、不可逆/给别人的好档逐步回审）。
 - `--cwd` 决定针对哪个项目派发，并用各厂商的原生参数钉死（claude `--add-dir`、codex `-C`、
   opencode `--dir`），不靠进程 cwd。opencode 尤其必须给：它**完全无视进程 cwd**，不给就会跑去
   改它自己记着的上一个项目，且照样 exit 0。

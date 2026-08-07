@@ -122,9 +122,14 @@ def test_shared_skill_contains_the_role_and_compaction_contract() -> None:
     # goes back to asking the user to open a second window for a one-command job.
     assert "默认走 `ask`" in text
     # The role split is the whole point: claude/codex decide, opencode executes,
-    # and nothing reaches opencode until a decision-maker has seen the plan.
+    # and no *plan* reaches opencode until a decision-maker has seen it.
     assert "只当执行者" in text
     assert "先咨询，后执行" in text
+    # The gate is on consultation, not on dispatch.  Without this the model
+    # reads the rule as per-task and either grinds through mechanical work
+    # itself or burns a consultation round on a typo fix.
+    assert "廉价劳力" in text
+    assert "这件事有没有技术取舍" in text
 
 
 def test_shared_skill_routes_to_one_manual_per_vendor() -> None:
@@ -141,12 +146,14 @@ def test_shared_skill_routes_to_one_manual_per_vendor() -> None:
     manuals = {
         "claude-code.md": (
             "先让 codex 过一遍方案",
+            "廉价劳力",
             "AI_ROOM_CLAUDE_SESSION_ID",
             "ai-room wait",
             "600",
         ),
         "codex.md": (
             "先让 claude 过一遍方案",
+            "廉价劳力",
             "CODEX_THREAD_ID",
             "ai-room wait",
             "timeout_ms",
