@@ -3,16 +3,34 @@
 `ai-room` 是一个 Windows 优先、本机运行的 CLI，让 Claude Code / Codex / opencode 互相咨询和派活。
 它有两条路，**默认是第一条**：
 
-1. **`ask` 无头派发（默认）**——一条命令派一个一次性子 agent 去咨询或干活，不需要窗口、不进
-   信箱、跑完即返回。三方都能调用，三方都能当目标。AI 决定要外援时应该直接派，而不是反问
-   用户"要不要开一个 codex 窗口"。见 [`ask`（无头子 agent 派发）](#ask无头子-agent-派发)。
+1. **`ask` 无头派发（默认）**——一条命令派一个一次性子 agent，不需要窗口、不进信箱、跑完即
+   返回。AI 决定要外援时应该直接派，而不是反问用户"要不要开一个 codex 窗口"。见
+   [`ask`（无头子 agent 派发）](#ask无头子-agent-派发)。
 2. **双窗口信箱顾问（用户点名才走）**——一个可见的 Codex 会话和一个可见的 Claude Code 会话
    通过 SQLite 房间互当顾问。opencode 参加不了这条。这一路当前状态仍是
    **awaiting dual-window acceptance**；真实双窗口验收尚未执行。
 
-两条路的对方角色不同，别混：信箱里的**顾问**只负责技术决策和需求、设计、计划文档的审查或
-修改，可以按需只读源码，但不能修改源码，也不能替主聊 AI 运行测试、构建、部署或其他真实
-操作；`ask` 派出去的是**工人**，`workspace-write` 档位下它就该改文件、跑测试构建。
+### 三个角色
+
+`ask` 这条路上角色是**固定的，不许串岗**：
+
+| 角色 | 是谁 | 干什么 |
+|---|---|---|
+| 主聊 | 此刻正在服务用户的那一个 | 出方案、拆任务、收口 |
+| **决策者**（咨询对象） | **对面那个 peer**：claude ↔ codex | 审方案、指出哪里要改、拍技术取舍。保持 `read-only`，不动手 |
+| **执行者** | **只有 opencode** | 接一件拆好的任务去做。不问它决策，不让它定方案 |
+
+于是 `ask` 有两种用法：**① 咨询决策者**（`--to <peer>`，只读，交上去的是你自己的方案，让他挑
+毛病）；**② 派 opencode 执行**（`--to opencode --permission workspace-write`，交上去的是一件
+边界清楚、完成标准明确的任务）。
+
+**硬顺序：先咨询，后执行。** 任何要交给 opencode 的任务，派之前必须先让决策者过一遍方案，
+否则就是让一个没有决策权的执行者去执行一个没人审过的方案。
+
+两种用法都必须把**场景上下文**说全——子 agent 是零上下文的，它不知道你在做什么项目。
+
+信箱那条路的角色另算：其中的**顾问**只负责技术决策和需求、设计、计划文档的审查或修改，可以
+按需只读源码，但不能修改源码，也不能替主聊 AI 运行测试、构建、部署或其他真实操作。
 
 ## 前置条件与开发安装
 
@@ -186,14 +204,24 @@ ai-room leave
 `ask` 把任务无头派发给某厂商 CLI 子 agent（claude / codex / opencode），不依赖可见会话或信箱，
 并把派发记录和子 agent 的 **session id** 追加到项目根目录 `.ai-room/ledger.md` 台账，供续接：
 
+两种用法（角色见上面的[三个角色](#三个角色)）：
+
 ```powershell
-ai-room ask --to claude --question "审查 OTA 升级风险" --related-doc Code/App/Code/app/Protocol/protocol_IoT.c
-ai-room ask --to codex --question "给这个函数加单测" --permission workspace-write
+# ① 咨询决策者：交上去的是自己的方案，只读
+ai-room ask --to claude --related-doc Code/App/Code/app/Protocol/protocol_IoT.c `
+  --question "项目是<X>，要解决<Y>。我的方案是<方案>，不确定的是<疑点>。请判断是否成立、哪里必须改。"
+
+# ② 派 opencode 执行：交上去的是一件拆好的任务，可写
+ai-room ask --to opencode --permission workspace-write --related-doc Code/App/Code/app/Protocol/protocol_IoT.c `
+  --question "方案已定为<定稿>（已过评审）。这一件任务：给 parse_frame 补边界单测并跑通。完成标准：<可验证标准>。"
 ```
 
-- 权限走档位 `--permission`，默认 `read-only`。`workspace-write` 允许子 agent 改文件、跑测试
-  和构建；`full-access` 解除沙箱。**派出去的是有手的工人，不是顾问**——顾问那套「只改指定文档、
-  不跑测试构建」的约束在这条路上不成立。
+- 权限走档位 `--permission`，默认 `read-only`。**咨询决策者时保持默认**——决策者不动手，给它
+  写权限就是角色串岗。只有派 opencode 执行时才用 `workspace-write`（改文件、跑测试和构建），
+  `full-access` 解除沙箱。**派给 opencode 的是有手的工人，不是顾问**——顾问那套「只改指定
+  文档、不跑测试构建」的约束在这条路上不成立。
+- 派 opencode 之前**必须先让决策者过一遍方案**。这条顺序 CLI 不强制，靠 skill 里的约定；
+  跳过它就是让一个没有决策权的执行者去执行一个没人审过的方案。
 - `--cwd` 决定针对哪个项目派发，并用各厂商的原生参数钉死（claude `--add-dir`、codex `-C`、
   opencode `--dir`），不靠进程 cwd。opencode 尤其必须给：它**完全无视进程 cwd**，不给就会跑去
   改它自己记着的上一个项目，且照样 exit 0。

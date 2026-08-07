@@ -121,6 +121,10 @@ def test_shared_skill_contains_the_role_and_compaction_contract() -> None:
     # `ask` is the default and the mailbox is opt-in.  Lose this and the model
     # goes back to asking the user to open a second window for a one-command job.
     assert "默认走 `ask`" in text
+    # The role split is the whole point: claude/codex decide, opencode executes,
+    # and nothing reaches opencode until a decision-maker has seen the plan.
+    assert "只当执行者" in text
+    assert "先咨询，后执行" in text
 
 
 def test_shared_skill_routes_to_one_manual_per_vendor() -> None:
@@ -130,26 +134,27 @@ def test_shared_skill_routes_to_one_manual_per_vendor() -> None:
     nothing, and the vendor that reads it silently loses its whole contract.
     """
     text = SOURCE_SKILL.read_text(encoding="utf-8")
-    # Each manual must carry the three things that vendor gets wrong without
-    # it: that `ask` is the default, how it is identified, and the shell
-    # timeout that silently kills a blocking `ask`.
+    # Each manual must name that vendor's own role and peer -- getting the
+    # peer wrong means consulting the executor or dispatching work to the
+    # decision-maker -- plus how it is identified and the shell timeout that
+    # silently kills a blocking `ask`.
     manuals = {
         "claude-code.md": (
-            "默认用 `ask`",
+            "先让 codex 过一遍方案",
             "AI_ROOM_CLAUDE_SESSION_ID",
             "ai-room wait",
             "600",
         ),
         "codex.md": (
-            "默认用 `ask`",
+            "先让 claude 过一遍方案",
             "CODEX_THREAD_ID",
             "ai-room wait",
             "timeout_ms",
         ),
-        # opencode has no mailbox identity at all, so its manual must say so
-        # rather than describe a protocol it cannot join.
+        # opencode is the executor and has no mailbox identity at all, so its
+        # manual must say both rather than describe a role it cannot hold.
         "opencode.md": (
-            "默认路径",
+            "你是干活的那一个",
             "只能用 `ask`",
             "invalid choice: 'opencode'",
             "OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS",
