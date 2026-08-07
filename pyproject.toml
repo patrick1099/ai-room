@@ -26,4 +26,4 @@ markers = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-ai_room = ["resources/SKILL.md"]
+ai_room = ["resources/*.md"]

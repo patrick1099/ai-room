@@ -44,6 +44,32 @@ def _skill_paths(home: Path) -> tuple[Path, Path]:
     )
 
 
+def _skill_file_names() -> tuple[str, ...]:
+    """Every file the skill is made of: the router plus one manual per vendor.
+
+    Read from the repository rather than hard-coded, so adding a manual does
+    not silently stop being installed.
+    """
+    return tuple(
+        sorted(path.name for path in SOURCE_SKILL.parent.iterdir() if path.suffix == ".md")
+    )
+
+
+def _expected_skill_files(home: Path) -> dict[Path, bytes]:
+    """Each destination the installer must write, mapped to its source bytes."""
+    return {
+        home / vendor / "skills" / "ai-room" / name: (
+            SOURCE_SKILL.parent / name
+        ).read_bytes()
+        for vendor in (".codex", ".claude")
+        for name in _skill_file_names()
+    }
+
+
+def _skill_operation_count() -> int:
+    return len(_skill_file_names()) * 2
+
+
 def _write_settings(home: Path, data: object) -> Path:
     path = _settings_path(home)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -87,9 +113,43 @@ def test_shared_skill_contains_the_role_and_compaction_contract() -> None:
         "/compact",
         "writable_docs",
     )
-    assert all(phrase in text for phrase in required_phrases)
-    assert "never edit source code" in text.lower()
-    assert "never run tests, builds, deployments, or real operations" in text.lower()
+    missing = [phrase for phrase in required_phrases if phrase not in text]
+    assert not missing, f"shared skill lost: {missing}"
+    # The advisor boundary is the one thing a reader must not be able to miss.
+    assert "绝不改源码" in text
+    assert "绝不替主聊跑测试、构建、部署或任何真实操作" in text
+
+
+def test_shared_skill_routes_to_one_manual_per_vendor() -> None:
+    """SKILL.md is a router: every vendor manual it names must exist.
+
+    Without this, dropping or renaming a manual leaves the router pointing at
+    nothing, and the vendor that reads it silently loses its whole contract.
+    """
+    text = SOURCE_SKILL.read_text(encoding="utf-8")
+    # Each manual must carry the two things that vendor gets wrong without it:
+    # how it is identified, and the shell timeout that silently kills `ask`.
+    manuals = {
+        "claude-code.md": ("AI_ROOM_CLAUDE_SESSION_ID", "ai-room wait", "600"),
+        "codex.md": ("CODEX_THREAD_ID", "ai-room wait", "timeout_ms"),
+        # opencode has no mailbox identity at all, so its manual must say so
+        # rather than describe a protocol it cannot join.
+        "opencode.md": (
+            "只能用 `ask`",
+            "invalid choice: 'opencode'",
+            "OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS",
+        ),
+    }
+    for name, required in manuals.items():
+        assert name in text, f"SKILL.md no longer routes to {name}"
+        manual = SOURCE_SKILL.parent / name
+        assert manual.is_file(), f"routed manual is missing: {manual}"
+        body = manual.read_text(encoding="utf-8")
+        for phrase in required:
+            assert phrase in body, f"{name} lost: {phrase!r}"
+        # Every manual must send the reader to the shared contract, not
+        # re-state it and drift.
+        assert "SKILL.md" in body, f"{name} does not point back at SKILL.md"
 
 
 def test_check_records_operations_without_writing(tmp_path: Path) -> None:
@@ -98,11 +158,9 @@ def test_check_records_operations_without_writing(tmp_path: Path) -> None:
 
     report = execute_install(plan, RecordingWriter())
 
-    assert [operation.action for operation in report.operations] == [
-        "write",
-        "write",
-        "write",
-    ]
+    assert [operation.action for operation in report.operations] == ["write"] * (
+        _skill_operation_count() + 1
+    )
     assert not home.exists()
 
 
@@ -112,9 +170,11 @@ def test_apply_installs_skills_and_one_session_start_hook(tmp_path: Path) -> Non
 
     report = execute_install(plan, FilesystemWriter())
 
-    assert len(report.operations) == 3
-    source_bytes = SOURCE_SKILL.read_bytes()
-    assert all(path.read_bytes() == source_bytes for path in _skill_paths(home))
+    assert len(report.operations) == _skill_operation_count() + 1
+    # The router is useless without the manuals it names, so both vendors must
+    # receive the whole directory, not just SKILL.md.
+    for path, expected in _expected_skill_files(home).items():
+        assert path.read_bytes() == expected, path
     data = json.loads(_settings_path(home).read_text(encoding="utf-8"))
     assert _ai_room_groups(data) == [plan.session_start_group]
 
@@ -130,11 +190,9 @@ def test_repeat_apply_is_idempotent_and_does_not_duplicate_hook(
 
     data = json.loads(_settings_path(home).read_text(encoding="utf-8"))
     assert _ai_room_groups(data) == [plan.session_start_group]
-    assert [operation.action for operation in second.operations] == [
-        "unchanged",
-        "unchanged",
-        "unchanged",
-    ]
+    assert [operation.action for operation in second.operations] == ["unchanged"] * (
+        _skill_operation_count() + 1
+    )
     assert not list(_settings_path(home).parent.glob("settings.json.*.bak"))
 
 
@@ -312,15 +370,10 @@ def test_unicode_and_spaces_paths_install_exact_skills_and_hook(
     }
     data = json.loads(_settings_path(home).read_text(encoding="utf-8"))
     assert _ai_room_groups(data) == [plan.session_start_group]
-    expected_hash = hashlib.sha256(SOURCE_SKILL.read_bytes()).hexdigest()
-    assert [operation.sha256 for operation in report.operations[:2]] == [
-        expected_hash,
-        expected_hash,
-    ]
-    assert all(
-        path.read_bytes() == SOURCE_SKILL.read_bytes()
-        for path in _skill_paths(home)
-    )
+    recorded = {operation.path: operation.sha256 for operation in report.operations}
+    for path, expected in _expected_skill_files(home).items():
+        assert path.read_bytes() == expected, path
+        assert recorded[path] == hashlib.sha256(expected).hexdigest(), path
 
 
 def test_installed_skill_hashes_match_repository_source(tmp_path: Path) -> None:
@@ -515,7 +568,7 @@ def test_main_check_uses_isolated_home_and_reports_without_writes(
     assert result == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["mode"] == "check"
-    assert len(payload["operations"]) == 3
+    assert len(payload["operations"]) == _skill_operation_count() + 1
     assert not home.exists()
 
 
@@ -580,12 +633,40 @@ def test_non_editable_install_uses_skill_matching_repository_source(
         errors="replace"
     )
 
+    # A wheel that ships the router without its manuals installs a skill that
+    # points at files that are not there, so the package data glob is part of
+    # the contract.
+    packaged_names = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from importlib.resources import files;"
+                "print(' '.join(sorted("
+                "entry.name for entry in files('ai_room').joinpath('resources').iterdir()"
+                " if entry.name.endswith('.md'))))"
+            ),
+        ],
+        cwd=tmp_path,
+        env=installed_environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert packaged_names.returncode == 0, packaged_names.stderr
+    assert packaged_names.stdout.split() == list(_skill_file_names())
+
     source_bytes = SOURCE_SKILL.read_bytes()
     assert packaged_skill.stdout == source_bytes
     expected_hash = hashlib.sha256(source_bytes).hexdigest()
     payload = json.loads(check_result.stdout)
-    assert [operation["sha256"] for operation in payload["operations"][:2]] == [
-        expected_hash,
-        expected_hash,
-    ]
+    installed_names: dict[str, set[str]] = {}
+    for operation in payload["operations"]:
+        operation_path = Path(operation["path"])
+        if operation_path.suffix == ".md":
+            installed_names.setdefault(operation_path.name, set()).add(
+                operation["sha256"]
+            )
+    assert set(installed_names) == set(_skill_file_names())
+    assert installed_names["SKILL.md"] == {expected_hash}
     assert not isolated_home.exists()

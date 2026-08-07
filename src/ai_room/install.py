@@ -1,5 +1,5 @@
 """结构: App installer over a small write Port with recording/filesystem Adapters.
-用途: Install identical ai-room guidance and one idempotent Claude hook.
+用途: Install the whole ai-room skill directory and one idempotent Claude hook.
 用法: python -m ai_room.install --check
 原始需求: Preview and apply one safe ordered install plan without replacing user configuration.
 """
@@ -49,12 +49,21 @@ class PathState(StrEnum):
 
 @dataclass(frozen=True)
 class InstallPlan:
-    skill_bytes: bytes
-    codex_skill: Path
-    claude_skill: Path
+    #: (file name, contents) for every file of the skill, SKILL.md first.
+    skill_files: tuple[tuple[str, bytes], ...]
+    codex_skill_dir: Path
+    claude_skill_dir: Path
     claude_settings: Path
     settings_backup: Path
     session_start_group: dict[str, object]
+
+    def skill_writes(self) -> tuple[tuple[Path, bytes], ...]:
+        """Every destination file and its contents, both vendors expanded."""
+        return tuple(
+            (directory / name, data)
+            for directory in (self.codex_skill_dir, self.claude_skill_dir)
+            for name, data in self.skill_files
+        )
 
 
 @dataclass(frozen=True)
@@ -144,15 +153,7 @@ def build_install_plan(
     """Build immutable destinations, source bytes, hook, and backup identity."""
     normalized_home = Path(home).expanduser()
     normalized_python = Path(python_exe)
-    if source_skill is None:
-        skill_bytes = _packaged_skill_bytes()
-    else:
-        normalized_source = Path(source_skill)
-        if _path_state(normalized_source) is not PathState.FILE:
-            raise InstallConflictError(
-                f"source skill is not a regular file: {normalized_source}"
-            )
-        skill_bytes = normalized_source.read_bytes()
+    skill_files = _skill_sources(source_skill)
 
     hook_command = subprocess.list2cmdline(
         [str(normalized_python), "-m", _HOOK_MODULE]
@@ -164,9 +165,9 @@ def build_install_plan(
     settings = normalized_home / ".claude" / "settings.json"
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     return InstallPlan(
-        skill_bytes=skill_bytes,
-        codex_skill=normalized_home / ".codex" / "skills" / "ai-room" / "SKILL.md",
-        claude_skill=normalized_home / ".claude" / "skills" / "ai-room" / "SKILL.md",
+        skill_files=skill_files,
+        codex_skill_dir=normalized_home / ".codex" / "skills" / "ai-room",
+        claude_skill_dir=normalized_home / ".claude" / "skills" / "ai-room",
         claude_settings=settings,
         settings_backup=settings.with_name(f"{settings.name}.{timestamp}.bak"),
         session_start_group=session_start_group,
@@ -189,7 +190,8 @@ def _prepare_install(
     plan: InstallPlan,
     writer: InstallWriter,
 ) -> tuple[_PreparedWrite, ...]:
-    destinations = (plan.codex_skill, plan.claude_skill, plan.claude_settings)
+    skill_writes = plan.skill_writes()
+    destinations = tuple(path for path, _ in skill_writes) + (plan.claude_settings,)
     states = _preflight_destinations(destinations, writer)
 
     existing_settings: bytes | None = None
@@ -214,8 +216,8 @@ def _prepare_install(
             )
 
     prepared: list[_PreparedWrite] = []
-    for path in (plan.codex_skill, plan.claude_skill):
-        prepared.append(_prepare_file(path, plan.skill_bytes, states[path], writer))
+    for path, data in skill_writes:
+        prepared.append(_prepare_file(path, data, states[path], writer))
 
     if existing_settings is not None and settings_changed:
         prepared.append(_prepared("backup", plan.settings_backup, existing_settings))
@@ -394,8 +396,39 @@ def _file_attributes(path: Path) -> int:
         return 0
 
 
-def _packaged_skill_bytes() -> bytes:
-    return files("ai_room").joinpath("resources", "SKILL.md").read_bytes()
+def _skill_sources(source_skill: Path | None) -> tuple[tuple[str, bytes], ...]:
+    """Load SKILL.md together with every vendor manual sitting beside it.
+
+    SKILL.md is a router: it names one manual per vendor and each vendor reads
+    only its own.  Installing the router without its manuals would leave the
+    reader pointed at files that do not exist, so the whole directory travels
+    as one unit and the caller still names only SKILL.md.
+    """
+    if source_skill is None:
+        directory = files("ai_room").joinpath("resources")
+        names = sorted(
+            entry.name for entry in directory.iterdir() if entry.name.endswith(".md")
+        )
+        loader = directory.joinpath
+    else:
+        normalized_source = Path(source_skill)
+        if _path_state(normalized_source) is not PathState.FILE:
+            raise InstallConflictError(
+                f"source skill is not a regular file: {normalized_source}"
+            )
+        parent = normalized_source.parent
+        names = sorted(
+            entry.name
+            for entry in parent.iterdir()
+            if entry.suffix == ".md" and _path_state(entry) is PathState.FILE
+        )
+        loader = parent.joinpath
+
+    if "SKILL.md" not in names:
+        raise InstallConflictError("skill source has no SKILL.md")
+    # SKILL.md first: the ordered plan should read as router-then-manuals.
+    names = ["SKILL.md"] + [name for name in names if name != "SKILL.md"]
+    return tuple((name, loader(name).read_bytes()) for name in names)
 
 
 def _build_parser() -> argparse.ArgumentParser:

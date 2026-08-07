@@ -37,10 +37,30 @@ python -m ai_room.install --check
 `--check` 和 `--apply` 共用同一条安装操作路径，但 `--check` 使用只记录、不落盘的 writer。
 检查输出中的目标应只包括：
 
-- `%USERPROFILE%\.codex\skills\ai-room\SKILL.md`
-- `%USERPROFILE%\.claude\skills\ai-room\SKILL.md`
+- `%USERPROFILE%\.codex\skills\ai-room\` 下的**整个 skill 目录**（`SKILL.md` + 三份 vendor 手册，见下节）
+- `%USERPROFILE%\.claude\skills\ai-room\` 下的同一批文件
 - `%USERPROFILE%\.claude\settings.json`
 - settings 需要改变时，同目录的 `settings.json.<UTC时间>.bak`
+
+安装源是 `integrations/ai-room/`（打包进 wheel 的副本在 `src/ai_room/resources/`，两者必须字节一致）。
+目录里的每个 `.md` 都会被装走，加一份新手册不需要改安装器代码。目标已存在且内容不同时安装器
+拒绝写入——本机若用 symlink 把这两个位置指到别处（例如 hub 金库），`--check` 会明确报
+`installation ancestor is not a directory`，这是有意为之：不穿过 symlink 覆盖别人管理的目录。
+
+## skill 的四个文件
+
+`SKILL.md` 是**路由**，不是全文：它讲三方共有的部分（两种能力、五条铁律、`ask` 命令形、信箱
+协议），然后按身份把读者分流到三份 vendor 手册。三方能力并不相同：
+
+| 读者 | 手册 | 能用 |
+|---|---|---|
+| Claude Code | `claude-code.md` | 信箱顾问 + `ask` |
+| Codex | `codex.md` | 信箱顾问 + `ask` |
+| opencode | `opencode.md` | **只有 `ask`** —— `AgentName` 里没有 opencode，也没有它的会话探测器，`join`/`wait`/`send`/`reply`/`status` 一律失败 |
+
+每份手册只写该 vendor 特有的机制：身份从哪个环境变量来、它自己的 shell 默认超时（claude ~600s、
+opencode 120s、codex **10s**）怎么和阻塞的 `ask`/`wait` 配合、以及它作为 `ask` 目标时的档位映射。
+共有的合同只在 `SKILL.md` 写一遍，手册不复述，避免四份文档互相漂移。
 
 只有用户看过预演并明确批准真实安装后，才可单独执行：
 
@@ -235,9 +255,10 @@ Codex 从当前 `CODEX_THREAD_ID` 对应的 token 记录读取输入 token；Cla
 
 回滚用户集成时只处理 ai-room 自己的内容：
 
-1. 确认 `%USERPROFILE%\.codex\skills\ai-room\SKILL.md` 和
-   `%USERPROFILE%\.claude\skills\ai-room\SKILL.md` 仍是 ai-room 安装副本，再删除这两个
-   `ai-room` skill 目录；用户改过的文件先备份，不要覆盖。
+1. 确认 `%USERPROFILE%\.codex\skills\ai-room\` 和 `%USERPROFILE%\.claude\skills\ai-room\`
+   里的每个 `.md` 都还是 ai-room 安装副本（和 `integrations/ai-room/` 逐字节比对），再删除
+   这两个 `ai-room` skill 目录；用户改过的文件先备份，不要覆盖。安装器只写不删，所以上一版
+   留下的旧手册若已改名，会残留在目录里，回滚时一并清掉。
 2. 若安装后 Claude settings 没有其他变化，可选择正确的
    `settings.json.<UTC时间>.bak` 恢复为 `settings.json`。若之后已有用户修改，则只从
    `hooks.SessionStart` 删除 command 含 `ai_room.hooks.claude_session_start` 的 ai-room
