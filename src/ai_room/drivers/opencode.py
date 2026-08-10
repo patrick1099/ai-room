@@ -8,7 +8,13 @@ import re
 from pathlib import Path
 
 from .process import find_binary, run_cli
-from .protocol import Driver, DriverRequest, DriverResult, compose_prompt
+from .protocol import (
+    Driver,
+    DriverRequest,
+    DriverResult,
+    compose_prompt,
+    session_id_watcher,
+)
 
 
 class OpenCodeDriver(Driver):
@@ -34,16 +40,35 @@ class OpenCodeDriver(Driver):
             command += ["--auto"]
         if request.model:
             command += ["--model", request.model]
+        if request.resume_session:
+            command += ["--session", request.resume_session]
         command.append(compose_prompt(request))
 
-        run = run_cli(command, cwd=request.cwd, timeout=request.timeout, agent=self.name)
+        run = run_cli(
+            command,
+            cwd=request.cwd,
+            timeout=request.timeout,
+            agent=self.name,
+            on_line=session_id_watcher(request),
+            max_runtime=request.max_runtime,
+        )
         session_id, text = _parse_jsonl(run.stdout)
+        return DriverResult(
+            agent=self.name,
+            session_id=session_id or request.resume_session,
+            text=text,
+            exit_code=run.returncode,
+            stderr=run.stderr.strip(),
+        )
+
+    def parse_partial(self, stdout: str) -> DriverResult:
+        session_id, text = _parse_jsonl(stdout)
         return DriverResult(
             agent=self.name,
             session_id=session_id,
             text=text,
-            exit_code=run.returncode,
-            stderr=run.stderr.strip(),
+            exit_code=-1,
+            stderr="",
         )
 
 

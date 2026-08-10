@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from abc import ABC, abstractmethod
@@ -52,6 +54,14 @@ class DriverRequest:
     ``permission`` is the tier, not a vendor spelling.  ``permission_mode`` and
     ``sandbox`` stay as raw per-vendor escape hatches and win over the tier when
     given.  ``related_docs`` is read-only context handed to the sub-agent.
+
+    ``timeout`` is a silence budget and ``max_runtime`` a hard cap; see
+    :func:`ai_room.drivers.process.run_cli`.
+
+    ``session_id`` is a handle chosen *before* the run (claude only).
+    ``resume_session`` is a handle from a run that already happened: setting it
+    continues that conversation instead of starting a new one, which is the
+    only way a killed dispatch does not have to be paid for twice.
     """
 
     question: str
@@ -65,6 +75,12 @@ class DriverRequest:
     extra_dirs: tuple[str, ...] = ()
     session_id: str | None = None
     agent_name: str | None = None
+    max_runtime: float | None = None
+    resume_session: str | None = None
+    #: Called with the sub-agent's session id the moment it announces one,
+    #: while the run is still going.  The handle must reach durable storage
+    #: before the run ends, because the run may not end on our terms.
+    on_session_id: Callable[[str], None] | None = None
 
     def __post_init__(self) -> None:
         if self.permission not in PERMISSION_TIERS:
@@ -106,6 +122,54 @@ def compose_prompt(request: DriverRequest) -> str:
     return question
 
 
+#: Every vendor announces its handle in the first event it emits, just under a
+#: different key: claude ``session_id``, codex ``thread_id``, opencode
+#: ``sessionID``.  All three are scanned regardless of which driver is running,
+#: because a stream cut mid-line may be all there is to go on.
+_SESSION_KEYS = ("session_id", "thread_id", "sessionID")
+
+
+def session_id_in_line(line: str) -> str | None:
+    """Return the session handle announced by one JSON event line, if any."""
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        event = json.loads(line)
+    except ValueError:
+        return None
+    if not isinstance(event, dict):
+        return None
+    for key in _SESSION_KEYS:
+        value = event.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def session_id_watcher(request: DriverRequest) -> Callable[[str], None] | None:
+    """Build the ``on_line`` callback that reports the handle as it appears.
+
+    Reporting it once is enough and reporting it twice is noise, so the watcher
+    latches.  Returns None when the caller did not ask to be told, so the
+    driver passes no callback at all rather than an empty one.
+    """
+    notify = request.on_session_id
+    if notify is None:
+        return None
+    seen: list[str] = []
+
+    def watch(line: str) -> None:
+        if seen:
+            return
+        session_id = session_id_in_line(line)
+        if session_id:
+            seen.append(session_id)
+            notify(session_id)
+
+    return watch
+
+
 class DriverError(RuntimeError):
     """Raised when a driver cannot prepare or run its vendor CLI."""
 
@@ -118,3 +182,15 @@ class Driver(ABC):
     @abstractmethod
     def invoke(self, request: DriverRequest) -> DriverResult:
         """Run the headless CLI once and return its parsed result."""
+
+    def parse_partial(self, stdout: str) -> DriverResult:
+        """Best-effort result from the output of a run that was cut short.
+
+        A killed run was still billed, so whatever the sub-agent had already
+        said belongs to the caller: it is often a usable answer, and it always
+        carries the handle needed to resume.  Overrides reuse the driver's own
+        parser, which must therefore tolerate a stream that ends mid-line.
+        """
+        return DriverResult(
+            agent=self.name, session_id=None, text="", exit_code=-1, stderr=""
+        )

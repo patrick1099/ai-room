@@ -21,8 +21,9 @@ ai-room ask --to codex --cwd /path/to/project \
 我的方案是：<方案>。我不确定的是 <具体疑点>。请判断方案是否成立、哪里必须改，给出理由。"
 
 # ② 采纳或说明理由后拆任务，逐件派 opencode 执行
+#    超时不用给 flag（默认值已由 ai-timeouts 调好）；要给的是**你这次 Bash 调用**的 timeout
 ai-room ask --to opencode --permission workspace-write --cwd /path/to/project \
-  --related-doc src/service.py --timeout 600 \
+  --related-doc src/service.py \
   --question "项目是 <X>，方案已定为 <定稿方案>（已经过 codex 评审）。
 这一件任务：<一件边界清楚的事>。完成标准：<可验证的标准>。不要动 <边界外的东西>。"
 ```
@@ -31,13 +32,21 @@ ai-room ask --to opencode --permission workspace-write --cwd /path/to/project \
 
 **机械活根本不用走这一步。opencode 是廉价劳力，随便用。** 批量改名/替换、跑格式化、加日志、照现成模式补样板代码、跑测试构建并摘出失败、写死板的单测骨架、大范围 grep 汇总、改错别字补注释补类型标注——这类活没有方案可审，直接派，别自己埋头做。判定只有一句：**这件事有没有技术取舍？** 没有就直接派。
 
-拿回结果看 `ok`（厂商自己的成败判定）、`text`（回答）、`changed_files`（回执，不是沙箱）、`session_id` / `ledger`（续接用）。**opencode 的产出你必须自己复核**，它是执行者不是负责人。
+拿回结果看 `ok`（厂商自己的成败判定）、`status`（`ok` / `error` / `timeout`）、`text`（回答，**超时时也有**，是它已经说出来的那部分）、`changed_files`（回执，不是沙箱）、`session_id` / `resume_command` / `ledger`（续接用）。**opencode 的产出你必须自己复核**，它是执行者不是负责人。
 
-各目标的档位映射见 `SKILL.md` 的「三个目标的差异」。这里只补一条你独有的：**派给 claude 时 session id 是派发前预分配的**（uuid 经 `--session-id` 传下去），哪怕子 agent 一个字没吐出来就被掐死，台账里那个 handle 照样能 `claude -r ID` 续上。
+各目标的档位映射见 `SKILL.md` 的「三个目标的差异」。这里只补一条你独有的：**派给 claude 时 session id 是派发前预分配的**（uuid 经 `--session-id` 传下去），哪怕子 agent 一个字没吐出来就被掐死，那个 handle 照样能续上（走 `ai-room resume --to claude --session ID`）。
 
-## 你的 Bash 工具超时：默认 ~600s，上限 600000ms
+## 三道闸，只有一道要你在调用时操心
 
-- **`ai-room ask`** 同步阻塞。咨询用默认 `--timeout 300` 在你 600s 窗口内安全；派 opencode 执行真任务要更大的 `--timeout` 时，**记得同时把 Bash 调用的 timeout 抬上去**，两道闸取小者生效。
+| 闸 | 是什么 | 谁在管 |
+|---|---|---|
+| **你 Bash 工具的 timeout** | **硬墙**——到点连 ai-room 进程一起杀，回执、台账全没有。**默认只有 120000ms** | 每次调用自己传，上限是 `BASH_MAX_TIMEOUT_MS` |
+| ai-room `--timeout` | **沉默预算**——只要子 agent 还在输出就一直不掐 | `AI_ROOM_TIMEOUT`，默认值已调好 |
+| ai-room `--max-runtime` | 硬顶——不管多话到点结束，**被有意设得比外层闸小**，好让 ai-room 先响、给出带 resume 的回执 | `AI_ROOM_MAX_RUNTIME`，默认值已调好 |
+
+- **要调的只有第一道。** 派真任务时把 Bash 调用的 `timeout` 传到上限；ai-room 那两个不用给 flag，默认值已经由 `ai-timeouts` 统一设好。`ai-timeouts show` 看当前值，`ai-timeouts set <分钟>` 一次性调全部——**别照抄文档里的数字，也别手动只动其中一个**。
+- **绝不要为了"躲开 Bash 超时"去压小 `--timeout`。** 它是"允许沉默多久"不是"允许跑多久"，压小只会误杀正在思考的子 agent，那一轮照样计费。
+- **超时不要重发。** 回执带 `session_id`、已产出的 `text` 和 `resume_command`——先看 `text`（常常已经够用），不够再跑 `resume_command`。重发同一条 ask 等于把计过费的一轮重新买一遍。连回执都没拿到（Bash 先把 ai-room 掐了）时直接 `ai-room resume --cwd <项目根>`，它会认领最近一个被掐死的派发。完整规则见 `SKILL.md` 的「超时了怎么办」。
 - **`ai-room wait`**（只在信箱模式下用）是故意阻塞且静默的，在 Bash 工具里跑就把 `timeout` 拉到上限。超时只是这次等待结束，**不会**离开房间、不会丢消息、不会确认掉任务；重跑即可，租约到期后同一条消息会重新投递。用户按 Esc 或 Ctrl+C 同理。
 
 `ask` 不会 detach。要边等边干活就自己起一个 subagent 去做那次阻塞调用——但代理开销起步两三分钟，咨询同步做，只有真任务才值得代理。

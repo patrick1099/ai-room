@@ -50,8 +50,73 @@ def test_run_cli_replaces_bad_bytes(tmp_path: Path) -> None:
 def test_run_cli_times_out(tmp_path: Path) -> None:
     script = tmp_path / "sleep.py"
     script.write_text("import time\ntime.sleep(10)\n", encoding="utf-8")
-    with pytest.raises(DriverTimeout):
+    with pytest.raises(DriverTimeout) as caught:
         run_cli([sys.executable, str(script)], cwd=tmp_path, timeout=0.3, agent="test")
+    assert caught.value.reason == "idle"
+
+
+def test_a_child_that_keeps_talking_is_not_killed_at_the_deadline(
+    tmp_path: Path,
+) -> None:
+    """The timeout is a silence budget, not a wall clock.
+
+    This is the regression that cost real money: a sub-agent streaming its
+    answer was killed on a fixed deadline, and the caller -- seeing only a
+    timeout -- re-dispatched the same task and paid for the whole turn again.
+    """
+    script = tmp_path / "chatty.py"
+    script.write_text(
+        "import time\n"
+        "for i in range(10):\n"
+        "    print('event %d' % i, flush=True)\n"
+        "    time.sleep(0.15)\n",
+        encoding="utf-8",
+    )
+    run = run_cli(
+        [sys.executable, str(script)], cwd=tmp_path, timeout=0.6, agent="test"
+    )
+    assert run.returncode == 0
+    assert "event 9" in run.stdout
+
+
+def test_progress_on_stderr_also_counts_as_being_alive(tmp_path: Path) -> None:
+    """Some vendors log progress to stderr; that is not silence."""
+    script = tmp_path / "logger.py"
+    script.write_text(
+        "import sys, time\n"
+        "for i in range(8):\n"
+        "    sys.stderr.write('working %d\\n' % i)\n"
+        "    sys.stderr.flush()\n"
+        "    time.sleep(0.15)\n"
+        "print('done')\n",
+        encoding="utf-8",
+    )
+    run = run_cli(
+        [sys.executable, str(script)], cwd=tmp_path, timeout=0.6, agent="test"
+    )
+    assert run.stdout.strip() == "done"
+
+
+def test_max_runtime_stops_a_sub_agent_that_never_converges(tmp_path: Path) -> None:
+    """Talking forever must not buy unlimited time -- that is the other failure."""
+    script = tmp_path / "forever.py"
+    script.write_text(
+        "import time\n"
+        "while True:\n"
+        "    print('still going', flush=True)\n"
+        "    time.sleep(0.1)\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(DriverTimeout) as caught:
+        run_cli(
+            [sys.executable, str(script)],
+            cwd=tmp_path,
+            timeout=30,
+            agent="test",
+            max_runtime=1.0,
+        )
+    assert caught.value.reason == "max-runtime"
+    assert "still going" in caught.value.stdout
 
 
 def _slow_talker(tmp_path: Path) -> Path:

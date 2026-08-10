@@ -23,6 +23,14 @@ the output were only parsed at the end, the session id would die with the
 process and the turn that was already paid for could not be resumed.  The
 ``on_line`` callback exists so a driver can pull the session id out of the first
 event and persist it seconds into the run.
+
+The timeout is a **silence budget, not a wall clock**.  A sub-agent that is
+still emitting events is still working, and killing it on a fixed deadline
+throws away a turn that was about to finish -- the caller then re-dispatches
+the same task from scratch and pays for it twice.  So the deadline is pushed
+back on every line either pipe produces, and only genuine silence ends the run.
+``max_runtime`` is the separate guard against a sub-agent that chatters forever
+without converging.
 """
 
 from __future__ import annotations
@@ -34,21 +42,34 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Thread
+from time import monotonic
 
 from .protocol import DriverError
 
 
 class DriverTimeout(DriverError):
-    """Raised when a headless vendor CLI exceeds its timeout budget.
+    """Raised when a headless vendor CLI runs out of silence or runtime budget.
 
     Carries whatever the sub-agent managed to emit before it was killed, so the
     caller can still recover the session id and bill from a timed-out run.
+    ``reason`` is ``"idle"`` (went quiet) or ``"max-runtime"`` (never stopped),
+    which the caller reports so a human can tell "it hung" from "it rambled".
     """
 
-    def __init__(self, message: str, *, stdout: str = "", stderr: str = "") -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        stdout: str = "",
+        stderr: str = "",
+        reason: str = "idle",
+        elapsed: float | None = None,
+    ) -> None:
         super().__init__(message)
         self.stdout = stdout
         self.stderr = stderr
+        self.reason = reason
+        self.elapsed = elapsed
 
 
 @dataclass(frozen=True)
@@ -80,6 +101,7 @@ def run_cli(
     timeout: float,
     agent: str,
     on_line: Callable[[str], None] | None = None,
+    max_runtime: float | None = None,
 ) -> CompletedRun:
     """Run ``command`` once, streaming its UTF-8 output as it arrives.
 
@@ -88,8 +110,12 @@ def run_cli(
     the process being killed from outside -- above all the session id, which
     every vendor emits in its first event.
 
-    Raises :class:`DriverTimeout` when the subprocess exceeds ``timeout``
-    seconds and :class:`DriverError` when the process cannot be started.
+    ``timeout`` is how long the sub-agent may stay **silent**, not how long it
+    may run: any line on either pipe resets it.  ``max_runtime`` caps the total
+    run regardless of how talkative it is; ``None`` means no cap.
+
+    Raises :class:`DriverTimeout` when either budget runs out and
+    :class:`DriverError` when the process cannot be started.
     """
     try:
         process = subprocess.Popen(
@@ -109,14 +135,22 @@ def run_cli(
     stdout_chunks: list[str] = []
     stderr_chunks: list[str] = []
     callback_error: BaseException | None = None
+    started = monotonic()
+    #: Written by the pump threads, read by the waiting thread.  A float
+    #: assignment is atomic under the GIL and a stale read only ever costs one
+    #: poll interval, so this deliberately takes no lock.
+    last_activity = started
 
     def pump(stream, sink: list[str], notify: bool) -> None:
         # Both pipes must be drained concurrently or a chatty stderr fills its
         # buffer and deadlocks the child while we wait on stdout.
-        nonlocal callback_error
+        nonlocal callback_error, last_activity
         try:
             for line in stream:
                 sink.append(line)
+                # Any line from either pipe is proof of life: stderr counts,
+                # because a vendor that logs progress there is not idle.
+                last_activity = monotonic()
                 if notify and on_line is not None and callback_error is None:
                     try:
                         on_line(line.rstrip("\r\n"))
@@ -134,17 +168,37 @@ def run_cli(
     for thread in pumps:
         thread.start()
 
-    try:
-        process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired as error:
-        _kill_tree(process)
-        for thread in pumps:
-            thread.join(timeout=_DRAIN_SECONDS)
-        raise DriverTimeout(
-            f"{agent} sub-agent timed out after {timeout:g}s",
-            stdout="".join(stdout_chunks),
-            stderr="".join(stderr_chunks),
-        ) from error
+    while True:
+        try:
+            process.wait(timeout=_POLL_SECONDS)
+            break
+        except subprocess.TimeoutExpired as error:
+            now = monotonic()
+            idle = now - last_activity
+            elapsed = now - started
+            if idle >= timeout:
+                reason = "idle"
+                detail = (
+                    f"went quiet for {idle:.0f}s "
+                    f"(silence budget {timeout:g}s)"
+                )
+            elif max_runtime is not None and elapsed >= max_runtime:
+                reason = "max-runtime"
+                detail = f"hit the {max_runtime:g}s hard runtime cap"
+            else:
+                # Still talking, or still inside both budgets.  Keep waiting --
+                # this is the whole point: a working sub-agent is not killed.
+                continue
+            _kill_tree(process)
+            for thread in pumps:
+                thread.join(timeout=_DRAIN_SECONDS)
+            raise DriverTimeout(
+                f"{agent} sub-agent {detail}; killed after {elapsed:.0f}s",
+                stdout="".join(stdout_chunks),
+                stderr="".join(stderr_chunks),
+                reason=reason,
+                elapsed=elapsed,
+            ) from error
 
     for thread in pumps:
         thread.join(timeout=_DRAIN_SECONDS)
@@ -158,6 +212,10 @@ def run_cli(
 
 #: How long to wait for the reader threads to finish after the child is gone.
 _DRAIN_SECONDS = 5.0
+
+#: How often the waiting thread re-checks the two budgets.  It also bounds how
+#: late a finished run is noticed, so it stays well under a second.
+_POLL_SECONDS = 0.25
 
 
 def _kill_tree(process: subprocess.Popen) -> None:

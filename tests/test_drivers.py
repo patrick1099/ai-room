@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from ai_room.drivers.claude import ClaudeDriver, _parse_json
+from ai_room.drivers.claude import ClaudeDriver, _parse_stream
 from ai_room.drivers.codex import CodexDriver, _parse_jsonl as _parse_codex_jsonl
 from ai_room.drivers.opencode import (
     OpenCodeDriver,
@@ -50,7 +50,7 @@ def test_unknown_driver_raises() -> None:
 
 def test_claude_parser_handles_real_single_object() -> None:
     """--output-format json returns one object, not a list."""
-    parsed = _parse_json(_fixture("driver_claude.json"))
+    parsed = _parse_stream(_fixture("driver_claude.json"))
     assert parsed.session_id == "ccf35261-fbc5-4a16-b48c-db4b1b66e966"
     assert parsed.text == "hi"
     assert parsed.is_error is False
@@ -66,13 +66,13 @@ def test_claude_parser_handles_list_legacy() -> None:
         '[{"session_id":"sess-1","type":"assistant","message":{"content":"think"}},'
         '{"session_id":"sess-1","type":"result","result":"final answer"}]'
     )
-    parsed = _parse_json(payload)
+    parsed = _parse_stream(payload)
     assert parsed.session_id == "sess-1"
     assert parsed.text == "final answer"
 
 
 def test_claude_parser_non_json_returns_stdout() -> None:
-    parsed = _parse_json("plain text output")
+    parsed = _parse_stream("plain text output")
     assert parsed.session_id is None
     assert parsed.text == "plain text output"
 
@@ -83,7 +83,7 @@ def test_claude_parser_captures_permission_denials() -> None:
         '"is_error":true,"subtype":"error_during_execution",'
         '"permission_denials":["Edit:/etc/passwd"],"total_cost_usd":0.5,"num_turns":3}'
     )
-    parsed = _parse_json(payload)
+    parsed = _parse_stream(payload)
     assert parsed.is_error is True
     assert parsed.subtype == "error_during_execution"
     assert parsed.permission_denials == ("Edit:/etc/passwd",)
@@ -171,33 +171,40 @@ def test_compose_prompt_writable_omits_read_only_notice() -> None:
 # --- argv-shape tests: each driver must build the exact vendor CLI contract. ---
 
 
-def _fake_run(command, cwd, timeout, agent):
+def _fake_run(command, cwd, timeout, agent, **kwargs):
     """Return a canned CompletedRun so invoke() does not touch the real CLI."""
     from ai_room.drivers.process import CompletedRun
 
     return CompletedRun(returncode=0, stdout="{}", stderr="")
 
 
-def _capture_argv(
+def _capture_call(
     monkeypatch, module: str, driver, request: DriverRequest
-) -> list[str]:
-    """Run ``driver.invoke(request)`` with run_cli stubbed and return the argv.
+) -> dict:
+    """Run ``driver.invoke(request)`` with run_cli stubbed and return the call.
 
     The ``_is_git_repo`` hook exists only on the codex module, so it is patched
     automatically when present instead of being a caller-supplied flag.
     """
-    captured: dict[str, list[str]] = {}
+    captured: dict = {}
 
-    def fake_run(command, cwd, timeout, agent):
-        captured["command"] = command
-        return _fake_run(command, cwd, timeout, agent)
+    def fake_run(command, cwd, timeout, agent, **kwargs):
+        captured.update(command=command, cwd=cwd, timeout=timeout, **kwargs)
+        return _fake_run(command, cwd, timeout, agent, **kwargs)
 
     monkeypatch.setattr(f"{module}.find_binary", lambda *a, **k: "binary")
     monkeypatch.setattr(f"{module}.run_cli", fake_run)
     if hasattr(__import__(module, fromlist=["x"]), "_is_git_repo"):
         monkeypatch.setattr(f"{module}._is_git_repo", lambda cwd: True)
     driver.invoke(request)
-    return captured["command"]
+    return captured
+
+
+def _capture_argv(
+    monkeypatch, module: str, driver, request: DriverRequest
+) -> list[str]:
+    """Run ``driver.invoke(request)`` with run_cli stubbed and return the argv."""
+    return _capture_call(monkeypatch, module, driver, request)["command"]
 
 
 def _value_at(argv: list[str], flag: str) -> str:
@@ -212,7 +219,13 @@ def _all_values(argv: list[str], flag: str) -> list[str]:
 # ---- claude ----
 
 
-def test_claude_argv_json_output_format(monkeypatch) -> None:
+def test_claude_argv_streams_json(monkeypatch) -> None:
+    """The streamed format is what makes the silence budget mean anything.
+
+    With ``--output-format json`` claude emits nothing until it is done, so a
+    thinking sub-agent and a hung one look identical and the idle deadline
+    degenerates into a wall clock.
+    """
     argv = _capture_argv(
         monkeypatch,
         "ai_room.drivers.claude",
@@ -221,7 +234,8 @@ def test_claude_argv_json_output_format(monkeypatch) -> None:
     )
     assert argv[0] == "binary"
     assert argv[1] == "-p"
-    assert _value_at(argv, "--output-format") == "json"
+    assert _value_at(argv, "--output-format") == "stream-json"
+    assert "--verbose" in argv
 
 
 def test_claude_prompt_is_value_of_p_not_trailing(monkeypatch) -> None:
@@ -626,3 +640,170 @@ def test_opencode_model_flag(monkeypatch) -> None:
         DriverRequest(question="q", cwd=Path("."), model="opencode-1"),
     )
     assert _value_at(argv, "--model") == "opencode-1"
+
+
+# --- resuming: continue a paid-for turn instead of paying for it twice ---
+
+_RESUME_CASES = (
+    ("ai_room.drivers.claude", ClaudeDriver, "-r"),
+    ("ai_room.drivers.opencode", OpenCodeDriver, "--session"),
+)
+
+
+@pytest.mark.parametrize("module, driver_cls, flag", _RESUME_CASES)
+def test_resume_passes_the_handle_to_the_vendor(
+    monkeypatch, module: str, driver_cls, flag: str
+) -> None:
+    argv = _capture_argv(
+        monkeypatch,
+        module,
+        driver_cls(),
+        DriverRequest(question="continue", cwd=Path("."), resume_session="sess-9"),
+    )
+    assert _value_at(argv, flag) == "sess-9"
+
+
+def test_claude_resume_does_not_also_preassign_a_handle(monkeypatch) -> None:
+    """-r and --session-id are mutually exclusive: one continues, one creates."""
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.claude",
+        ClaudeDriver(),
+        DriverRequest(
+            question="continue",
+            cwd=Path("."),
+            session_id="fresh-uuid",
+            resume_session="sess-9",
+        ),
+    )
+    assert _value_at(argv, "-r") == "sess-9"
+    assert "--session-id" not in argv
+
+
+def test_codex_resume_is_a_subcommand_carrying_the_tier_as_config(
+    monkeypatch,
+) -> None:
+    """``codex exec resume`` accepts neither -s nor -C.
+
+    Verified against the installed CLI's help: the sandbox tier therefore has
+    to travel as a ``-c sandbox_mode=`` override or a resumed dispatch would
+    silently fall back to whatever config.toml says.
+    """
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.codex",
+        CodexDriver(),
+        DriverRequest(
+            question="continue",
+            cwd=Path("."),
+            permission="workspace-write",
+            resume_session="thr-9",
+        ),
+    )
+    assert argv[:5] == ["binary", "exec", "resume", "thr-9", "--json"]
+    assert "-s" not in argv
+    assert "-C" not in argv
+    assert 'sandbox_mode="workspace-write"' in _all_values(argv, "-c")
+
+
+def test_resumed_result_keeps_the_handle_even_if_the_stream_omits_it(
+    monkeypatch,
+) -> None:
+    """Losing the handle on resume would make the next failure unresumable."""
+    monkeypatch.setattr("ai_room.drivers.opencode.find_binary", lambda *a, **k: "b")
+    monkeypatch.setattr(
+        "ai_room.drivers.opencode.run_cli",
+        lambda *a, **k: _fake_run([], Path("."), 1, "opencode"),
+    )
+    result = OpenCodeDriver().invoke(
+        DriverRequest(question="q", cwd=Path("."), resume_session="ses-keep")
+    )
+    assert result.session_id == "ses-keep"
+
+
+# --- streaming: the handle must reach the caller before the run ends ---
+
+
+@pytest.mark.parametrize(
+    "module, driver_cls, event",
+    (
+        ("ai_room.drivers.claude", ClaudeDriver, '{"session_id":"a-1"}'),
+        ("ai_room.drivers.codex", CodexDriver, '{"thread_id":"a-1"}'),
+        ("ai_room.drivers.opencode", OpenCodeDriver, '{"sessionID":"a-1"}'),
+    ),
+)
+def test_driver_reports_the_session_id_mid_run(
+    monkeypatch, module: str, driver_cls, event: str
+) -> None:
+    """Every driver must wire on_line, or an outside kill loses the handle.
+
+    This is the case the streaming plumbing exists for, and all three drivers
+    used to leave it unconnected.
+    """
+    seen: list[str] = []
+    call = _capture_call(
+        monkeypatch,
+        module,
+        driver_cls(),
+        DriverRequest(question="q", cwd=Path("."), on_session_id=seen.append),
+    )
+    assert call["on_line"] is not None
+    call["on_line"](event)
+    call["on_line"]('{"session_id":"later"}')
+    assert seen == ["a-1"]
+
+
+@pytest.mark.parametrize(
+    "module, driver_cls",
+    (
+        ("ai_room.drivers.claude", ClaudeDriver),
+        ("ai_room.drivers.codex", CodexDriver),
+        ("ai_room.drivers.opencode", OpenCodeDriver),
+    ),
+)
+def test_driver_forwards_both_budgets(monkeypatch, module: str, driver_cls) -> None:
+    call = _capture_call(
+        monkeypatch,
+        module,
+        driver_cls(),
+        DriverRequest(question="q", cwd=Path("."), timeout=12.0, max_runtime=99.0),
+    )
+    assert call["timeout"] == 12.0
+    assert call["max_runtime"] == 99.0
+
+
+@pytest.mark.parametrize(
+    "driver, stdout, session_id, text",
+    (
+        (
+            ClaudeDriver(),
+            '{"type":"system","session_id":"c-1"}\n'
+            '{"type":"result","session_id":"c-1","result":"half an answer"}\n'
+            '{"type":"resu',
+            "c-1",
+            "half an answer",
+        ),
+        (
+            CodexDriver(),
+            '{"type":"thread.started","thread_id":"x-1"}\n'
+            '{"type":"item.completed","item":{"type":"agent_message","text":"partial"}}\n'
+            '{"type":"item.st',
+            "x-1",
+            "partial",
+        ),
+        (
+            OpenCodeDriver(),
+            '{"sessionID":"o-1","part":{"id":"p1","type":"text","text":"partial"}}\n'
+            '{"sessionID":"o-1","par',
+            "o-1",
+            "partial",
+        ),
+    ),
+)
+def test_parse_partial_salvages_a_cut_stream(
+    driver, stdout: str, session_id: str, text: str
+) -> None:
+    """A killed turn was billed, so its half-answer belongs to the caller."""
+    result = driver.parse_partial(stdout)
+    assert result.session_id == session_id
+    assert result.text == text

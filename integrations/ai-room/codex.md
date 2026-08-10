@@ -15,12 +15,27 @@
 
 三方里你最短，短一个数量级。
 
-```
-你的 shell 超时（默认 10s）  ←  连一个普通提问都撑不到
-ai-room --timeout（默认 300s）
-```
+**每一次调用 `ai-room ask` 都必须显式给 `timeout_ms`**，否则命令必然被掐死。这不是"长任务才需要注意"——一趟咨询就要几十秒，10 秒连子 agent 启动都不够。信箱模式下的 `ai-room wait` 同理。
 
-**每一次调用 `ai-room ask` 都必须显式给 `timeout_ms`**，否则命令必然被掐死。这不是"长任务才需要注意"——一趟咨询就要几十秒，10 秒连子 agent 启动都不够。派 opencode 执行真任务还要再放大。信箱模式下的 `ai-room wait` 同理。
+**传多少不用猜**：本机把这个数存在环境变量 `AI_ROOM_DISPATCH_TIMEOUT_MS` 里（毫秒），派 ai-room 时照抄它即可。你是三方里唯一**没有全局旋钮**的，只能每次自己带上。要调整全局值用 `ai-timeouts set <分钟>`，`ai-timeouts show` 看当前值。
+
+三道闸性质完全不同，别搞混：
+
+| 闸 | 是什么 | 谁在管 |
+|---|---|---|
+| **你的 shell 超时** | **硬墙**——到点连 ai-room 进程一起杀，`except` 一句都不会跑，回执台账全没有 | 你每次调用自己传 `timeout_ms`（默认 10s！）|
+| ai-room `--timeout` | **沉默预算**——只要子 agent 还在输出就一直不掐 | `AI_ROOM_TIMEOUT`，默认值已调好 |
+| ai-room `--max-runtime` | 硬顶——不管多话到点结束，**被有意设得比外层闸小**，好让 ai-room 先响、给出带 resume 的回执 | `AI_ROOM_MAX_RUNTIME`，默认值已调好 |
+
+**要给的只有第一道**，ai-room 那两个不用带 flag。**绝不要为了"躲开 shell 超时"去压小 `--timeout`**——它是"允许沉默多久"不是"允许跑多久"，压小只会误杀正在思考的子 agent，那一轮照样按整轮计费。
+
+## 被掐死了：续接，别重发
+
+超时那一轮**已经计过费了**。重发同一条 `ask` 是让子 agent 从零重做，同一份钱付两次。
+
+- ai-room 自己判超时时，回执带 `session_id`、已产出的 `text` 和 `resume_command`——先看 `text`（常常已经够用），不够就跑 `resume_command`。
+- **你这道 10 秒的闸尤其容易先掐**，那种情况连回执都没有。直接跑 `ai-room resume --cwd <项目根>`：session id 在子 agent 一开口时就落盘到 `.ai-room/inflight/`，进程被杀也还在。
+- 完整规则见 `SKILL.md` 的「超时了怎么办」。
 
 ## 主聊的完整流程
 
@@ -32,8 +47,9 @@ ai-room ask --to claude --cwd /path/to/project \
 我的方案是：<方案>。我不确定的是 <具体疑点>。请判断方案是否成立、哪里必须改，给出理由。"
 
 # ② 采纳或说明理由后拆任务，逐件派 opencode 执行
+#    ai-room 的超时不用给 flag；要给的是你这次 shell 调用的 timeout_ms
 ai-room ask --to opencode --permission workspace-write --cwd /path/to/project \
-  --related-doc src/parser.c --timeout 600 \
+  --related-doc src/parser.c \
   --question "项目是 <X>，方案已定为 <定稿方案>（已经过 claude 评审）。
 这一件任务：<一件边界清楚的事>。完成标准：<可验证的标准>。不要动 <边界外的东西>。"
 ```
@@ -42,7 +58,7 @@ ai-room ask --to opencode --permission workspace-write --cwd /path/to/project \
 
 **机械活根本不用走这一步。opencode 是廉价劳力，随便用。** 批量改名/替换、跑格式化、加日志、照现成模式补样板代码、跑测试构建并摘出失败、写死板的单测骨架、大范围 grep 汇总、改错别字补注释补类型标注——这类活没有方案可审，直接派，别自己埋头做。判定只有一句：**这件事有没有技术取舍？** 没有就直接派。
 
-拿回结果看 `ok`、`text`、`changed_files`（回执，不是沙箱）、`session_id` / `ledger`。**opencode 的产出你必须自己复核**，它是执行者不是负责人。
+拿回结果看 `ok`、`status`（`ok` / `error` / `timeout`）、`text`（**超时时也有**，是它已经说出来的那部分）、`changed_files`（回执，不是沙箱）、`session_id` / `resume_command` / `ledger`。**opencode 的产出你必须自己复核**，它是执行者不是负责人。
 
 `ask` 不会 detach。要边等边干活就自己起一个子 agent 去做那次阻塞调用；但代理开销起步两三分钟，咨询同步做，只有真任务才值得代理。
 

@@ -6,7 +6,13 @@ import json
 from dataclasses import dataclass
 
 from .process import find_binary, run_cli
-from .protocol import Driver, DriverRequest, DriverResult, compose_prompt
+from .protocol import (
+    Driver,
+    DriverRequest,
+    DriverResult,
+    compose_prompt,
+    session_id_watcher,
+)
 
 
 class ClaudeDriver(Driver):
@@ -15,12 +21,19 @@ class ClaudeDriver(Driver):
 
     def invoke(self, request: DriverRequest) -> DriverResult:
         binary = find_binary(self.name, self._BINARY_CANDIDATES)
+        # stream-json rather than json: with the single-object format claude
+        # says nothing at all until it is finished, so there is no way to tell
+        # a sub-agent that is thinking from one that has hung, and the silence
+        # budget would degenerate back into a wall clock.  The streamed form
+        # emits progress events throughout, and carries the same result object
+        # as its final event.  ``--verbose`` is required for it under ``-p``.
         command = [
             binary,
             "-p",
             compose_prompt(request),
             "--output-format",
-            "json",
+            "stream-json",
+            "--verbose",
         ]
         if request.permission == "full-access":
             command += ["--dangerously-skip-permissions"]
@@ -35,7 +48,11 @@ class ClaudeDriver(Driver):
             command += ["--allowedTools", "Edit,Write"]
         if request.model:
             command += ["--model", request.model]
-        if request.session_id:
+        if request.resume_session:
+            # -r continues the recorded conversation; --session-id would demand
+            # a fresh handle and the two cannot both be given.
+            command += ["-r", request.resume_session]
+        elif request.session_id:
             command += ["--session-id", request.session_id]
         if request.agent_name:
             command += ["--agent", request.agent_name]
@@ -44,11 +61,18 @@ class ClaudeDriver(Driver):
             for d in request.extra_dirs:
                 command += ["--add-dir", str(d)]
 
-        run = run_cli(command, cwd=request.cwd, timeout=request.timeout, agent=self.name)
-        parsed = _parse_json(run.stdout)
+        run = run_cli(
+            command,
+            cwd=request.cwd,
+            timeout=request.timeout,
+            agent=self.name,
+            on_line=session_id_watcher(request),
+            max_runtime=request.max_runtime,
+        )
+        parsed = _parse_stream(run.stdout)
         return DriverResult(
             agent=self.name,
-            session_id=parsed.session_id,
+            session_id=parsed.session_id or request.resume_session,
             text=parsed.text,
             exit_code=run.returncode,
             stderr=run.stderr.strip(),
@@ -59,6 +83,52 @@ class ClaudeDriver(Driver):
             num_turns=parsed.num_turns,
             usage=parsed.usage,
         )
+
+    def parse_partial(self, stdout: str) -> DriverResult:
+        parsed = _parse_stream(stdout)
+        return DriverResult(
+            agent=self.name,
+            session_id=parsed.session_id,
+            text=parsed.text,
+            exit_code=-1,
+            stderr="",
+            subtype=parsed.subtype,
+            permission_denials=parsed.permission_denials,
+            total_cost_usd=parsed.total_cost_usd,
+            num_turns=parsed.num_turns,
+            usage=parsed.usage,
+        )
+
+
+def _decode_events(stdout: str) -> list[dict]:
+    """Decode vendor output into events, whatever framing it arrived in."""
+    text = stdout.strip()
+    if not text:
+        return []
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        pass
+    else:
+        if isinstance(payload, list):
+            return [event for event in payload if isinstance(event, dict)]
+        if isinstance(payload, dict):
+            return [payload]
+        return []
+    events: list[dict] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            # A stream cut mid-line, or a stray non-JSON banner.  Everything
+            # already decoded still counts.
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events
 
 
 @dataclass(frozen=True)
@@ -75,13 +145,17 @@ class ClaudeParsed:
     usage: dict | None = None
 
 
-def _parse_json(stdout: str) -> ClaudeParsed:
-    """Extract the authoritative outcome fields from claude json output.
+def _parse_stream(stdout: str) -> ClaudeParsed:
+    """Extract the authoritative outcome fields from claude's output.
 
-    ``--output-format json`` returns a single object (not a list), so the parser
-    accepts both a dict and a list.  Besides the session id and result text it
-    keeps the vendor's own ``is_error`` / ``subtype`` / ``permission_denials`` /
-    ``total_cost_usd`` / ``num_turns`` so the caller does not guess success.
+    Handles all three shapes the CLI can produce: the ``stream-json`` JSONL we
+    ask for, the single object of the older ``--output-format json``, and a
+    list.  Besides the session id and result text it keeps the vendor's own
+    ``is_error`` / ``subtype`` / ``permission_denials`` / ``total_cost_usd`` /
+    ``num_turns`` so the caller does not guess success.
+
+    A truncated stream must degrade rather than raise: this is also the parser
+    for a run that was killed, where the last line is routinely half-written.
     """
     session_id: str | None = None
     parts: list[str] = []
@@ -91,11 +165,9 @@ def _parse_json(stdout: str) -> ClaudeParsed:
     total_cost_usd: float | None = None
     num_turns: int | None = None
     usage: dict | None = None
-    try:
-        payload = json.loads(stdout)
-    except ValueError:
+    events = _decode_events(stdout)
+    if not events:
         return ClaudeParsed(session_id=None, text=stdout.strip())
-    events = payload if isinstance(payload, list) else [payload]
     for event in events:
         if not isinstance(event, dict):
             continue

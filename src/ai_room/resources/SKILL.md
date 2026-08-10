@@ -1,6 +1,6 @@
 ---
 name: ai-room
-description: 用本机 ai-room CLI 调动另一个 AI，默认走 `ask` 无头模式，两种用法——① **咨询决策者**：把自己的方案交给对面那个 peer 审（你是 claude 就问 codex，是 codex 就问 claude），让他说行不行、哪里要改；② **派 opencode 执行**：把拆好的任务交给它去做。角色固定不串岗：claude 和 codex 是咨询者兼决策者，opencode 只当执行者。**opencode 是廉价劳力，机械活随便派、鼓励派**；只有"有技术取舍"的活才要先让决策者过一遍方案，且那是方案级的一次，不是每件任务都重审。每次 ask 都要把场景上下文说全，子 agent 是零上下文的。当用户说"问问另一个 AI""让 codex 看看我的方案""派个子 agent 去做""opencode 跑一下"，或你要动手做一件有分量的事时使用。用户点名要"开两个窗口互当顾问 / 走信箱 / join"时才改用 join/wait/send/reply。
+description: 用本机 ai-room CLI 调动另一个 AI，默认走 `ask` 无头模式，两种用法——① **咨询决策者**：把自己的方案交给对面那个 peer 审（你是 claude 就问 codex，是 codex 就问 claude），让他说行不行、哪里要改；② **派 opencode 执行**：把拆好的任务交给它去做。角色固定不串岗：claude 和 codex 是咨询者兼决策者，opencode 只当执行者。**opencode 是廉价劳力，机械活随便派、鼓励派**；只有"有技术取舍"的活才要先让决策者过一遍方案，且那是方案级的一次，不是每件任务都重审。每次 ask 都要把场景上下文说全，子 agent 是零上下文的。当用户说"问问另一个 AI""让 codex 看看我的方案""派个子 agent 去做""opencode 跑一下"，或你要动手做一件有分量的事时使用。用户点名要"开两个窗口互当顾问 / 走信箱 / join"时才改用 join/wait/send/reply。派发超时后也读本 skill——超时的正确动作是 `ai-room resume` 续接，**不是**重发同一条 ask（那会把已经计过费的一轮重新买一遍）。
 ---
 
 # ai-room
@@ -104,26 +104,62 @@ ai-room ask --to opencode --question "<场景><这一件具体任务><完成标�
 ai-room ask --to claude|codex|opencode --question TEXT
             [--related-doc EXACT_PATH]...
             [--permission read-only|workspace-write|full-access]
-            [--model MODEL] [--cwd DIR] [--timeout SECONDS]
+            [--model MODEL] [--cwd DIR]
+            [--timeout SECONDS] [--max-runtime SECONDS]
             [--permission-mode MODE] [--sandbox MODE] [--no-ledger]
 ```
 
 - `--permission` 默认 `read-only`。`workspace-write` 允许子 agent 在工作目录里改文件、跑命令；`full-access` 解除沙箱。档位由 ask 自己钉死，**不继承本机的厂商配置**——同一个 flag 在不同 config 下含义不同。
 - `--cwd` 选择针对哪个项目派发。真正传给子 agent 的工作目录是**这个路径所在的 git 工作树根**，不是你给的子目录。不给就用当前进程 cwd。
-- `--timeout` 默认 **300 秒**，这是 ai-room 掐子进程的时间。**你自己 shell 工具的超时是另一道闸，通常更短**——各家默认值差异很大，见你那一份手册。
+- `--timeout` 是**"允许沉默多久"，不是"允许跑多久"**：子 agent 每吐一行（stdout 或 stderr）就把死线往后推，**还在输出的子 agent 不会被掐**。真正封顶的是 `--max-runtime`，不管它多话都到点结束。出厂默认是 300 / 3600 秒，但**本机实际值以 `ai-timeouts show` 为准**。
+- 这两个默认值由环境变量 `AI_ROOM_TIMEOUT` / `AI_ROOM_MAX_RUNTIME` 提供（显式给 flag 仍然优先）。要调就 `ai-timeouts set <分钟>`，一条命令把所有闸一起改到位——**不要手改其中一个**，闸之间的大小关系是有讲究的。
+- **平时两个都不用给 flag。** 该给的是**你自己 shell 工具的 timeout**，那是另一道闸，各家默认值差异很大（见你那一份手册），而且通常更短。
+- **绝不要为了"躲开 shell 超时"去压小 `--timeout`。** 压小的是沉默预算，只会把**正在思考的**子 agent 误杀，而那一轮照样按整轮计费——这正是最初把钱烧掉的那个动作。要让长任务跑得完，调大的是外层 shell 的 timeout。
+- ai-room 的硬顶被有意设得比外层闸小，好让**它先响**：ai-room 判的超时带完整回执（下一节），被外层掐则什么都拿不到。
 - **`ask` 是同步阻塞的**，返回时子 agent 已经跑完。一个咨询几十秒，一个真任务几分钟。它**不会** detach。
 - 退出码 0 表示厂商自己判定这一轮成功；失败和超时退 3。`changed_files` 是**回执**，只供复核，不影响退出码——派活时本来就不知道它该动哪些文件，没有可越的界。
 - 台账写在 `<工作树根>/.ai-room/ledger.md`，含子 agent 的 **session id** 供续接，并自动生成 `.ai-room/.gitignore`（内容 `*`）避免进仓库。`--no-ledger` 关闭。
 
+## 超时了怎么办：**续接，绝不重发**
+
+超时不等于这一轮没发生。**厂商已经按整轮计费了**，子 agent 多半已经想完、甚至说了一半。此时重发同一条 `ask`，是让它从零把同一件事再做一遍，**同一份钱付两次**，而且第二遍照样会超时。
+
+所以超时**不是报错，是一个带把手的结果**：`ok:false` + `status:"timeout"`，同时给你
+
+| 字段 | 是什么 |
+|---|---|
+| `timeout_reason` | `idle`（真沉默了）或 `max-runtime`（一直在说但不收敛） |
+| `session_id` | 这一轮的会话 id，从它已经吐出来的输出里抢救 |
+| `text` | 超时前已经说出来的那部分回答——经常已经够用 |
+| `resume_command` | 可直接跑的 `ai-room resume ...`，**默认动作就是它** |
+| `vendor_resume_command` | 厂商原生续接命令，ai-room 不可用时的兜底 |
+
+```text
+ai-room resume [--to claude|codex|opencode] [--session SESSION_ID]
+               [--question TEXT] [--cwd DIR]
+               （其余选项与 ask 完全相同）
+```
+
+- 不给 `--session` 就续接**本房间里最近一个被掐死的派发**：session id 在子 agent 一开口时就落盘到 `.ai-room/inflight/`，所以哪怕整个 ai-room 进程被你的 shell 掐掉（那种情况连台账都来不及写），把手也还在。
+- 给 `--session` 时**必须同时给 `--to`**：一个 id 不会自报是哪家发的。
+- 不给 `--question` 时默认告诉它"从停下的地方继续，别重头再来"。要补充信息就自己写，但**别把原任务重述一遍**——那等于让它重启。
+- 档位不会自动继承：`--permission` 等选项照原样再给一次。
+
+先看 `text`：如果超时前已经把话说完了，直接用，连 resume 都不用跑。
+
+**唯一该重发 `ask` 的情况**，是回执里连 `session_id` 都没有（`resume_command` 为 `null`）——子 agent 还没开口就被打死了，没有任何东西可续。
+
 ### 三个目标的差异
 
-| 目标 | `read-only` 映射成 | 可写档映射成 | session id | 续接 |
+| 目标 | `read-only` 映射成 | 可写档映射成 | session id | 原生续接 |
 |---|---|---|---|---|
 | claude | `--permission-mode plan` | `acceptEdits` + `--allowedTools Edit,Write`；`full-access` 是 `--dangerously-skip-permissions` | **派发前就预分配**，被掐死也能续 | `claude -r ID` |
 | codex | `-s read-only` + `approval_policy="never"` | `-s workspace-write` + 允许沙箱拒绝升级到沙箱外；`full-access` 是 `danger-full-access` | 它开口后才有 | `codex exec resume ID` |
 | opencode | `--agent plan` | `--auto`；**没有第三档，`full-access` 与 `workspace-write` 完全一样** | 它开口后才有 | `opencode run --session ID` |
 
-只有 claude 支持预分配 handle。派给 codex / opencode 的活被外层掐死时，session id 是从它已经吐出来的输出里边跑边抢救的，抢不到就没有。
+日常续接走 `ai-room resume`（它会重新钉住档位并记台账），上面这一列只是兜底。
+
+只有 claude 支持预分配 handle。派给 codex / opencode 的活被外层掐死时，session id 是从它已经吐出来的输出里**边跑边抢救**的，抢不到就没有。另外两条相关的实现事实：codex 的 `exec resume` 不吃 `-s` 也不吃 `-C`，档位改走 `-c sandbox_mode=`，工作目录沿用原会话记录的那个；claude 走 `--output-format stream-json`，因为单对象格式在跑完前一个字都不吐，沉默预算就无从判断。
 
 ## 能力 A 的信箱协议（**非默认**，用户点名才走；codex 和 claude 适用，**opencode 跳过本节**）
 

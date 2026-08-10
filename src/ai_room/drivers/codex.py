@@ -7,7 +7,13 @@ import subprocess
 from pathlib import Path
 
 from .process import find_binary, run_cli
-from .protocol import Driver, DriverRequest, DriverResult, compose_prompt
+from .protocol import (
+    Driver,
+    DriverRequest,
+    DriverResult,
+    compose_prompt,
+    session_id_watcher,
+)
 
 
 _TIER_TO_SANDBOX = {
@@ -52,26 +58,53 @@ class CodexDriver(Driver):
     def invoke(self, request: DriverRequest) -> DriverResult:
         binary = find_binary(self.name, self._BINARY_CANDIDATES)
         sandbox_mode = request.sandbox or _TIER_TO_SANDBOX[request.permission]
-        command = [binary, "exec", "--json", "-s", sandbox_mode]
-        for override in _TIER_TO_APPROVAL[request.permission]:
+        overrides = list(_TIER_TO_APPROVAL[request.permission])
+        if request.resume_session:
+            # ``codex exec resume`` accepts neither -s nor -C, so the tier has
+            # to travel as a config override and the working directory is
+            # whatever the recorded session was started in.
+            command = [binary, "exec", "resume", request.resume_session, "--json"]
+            overrides.insert(0, f'sandbox_mode="{sandbox_mode}"')
+        else:
+            command = [binary, "exec", "--json", "-s", sandbox_mode]
+        for override in overrides:
             command += ["-c", override]
-        command += ["-C", str(request.cwd)]
-        for d in request.extra_dirs:
-            command += ["--add-dir", d]
+        if not request.resume_session:
+            command += ["-C", str(request.cwd)]
+            for d in request.extra_dirs:
+                command += ["--add-dir", d]
         if request.model:
             command += ["-m", request.model]
         if not _is_git_repo(request.cwd):
             command += ["--skip-git-repo-check"]
         command.append(compose_prompt(request))
 
-        run = run_cli(command, cwd=request.cwd, timeout=request.timeout, agent=self.name)
+        run = run_cli(
+            command,
+            cwd=request.cwd,
+            timeout=request.timeout,
+            agent=self.name,
+            on_line=session_id_watcher(request),
+            max_runtime=request.max_runtime,
+        )
         session_id, text, usage = _parse_jsonl(run.stdout)
+        return DriverResult(
+            agent=self.name,
+            session_id=session_id or request.resume_session,
+            text=text,
+            exit_code=run.returncode,
+            stderr=run.stderr.strip(),
+            usage=usage,
+        )
+
+    def parse_partial(self, stdout: str) -> DriverResult:
+        session_id, text, usage = _parse_jsonl(stdout)
         return DriverResult(
             agent=self.name,
             session_id=session_id,
             text=text,
-            exit_code=run.returncode,
-            stderr=run.stderr.strip(),
+            exit_code=-1,
+            stderr="",
             usage=usage,
         )
 

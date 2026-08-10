@@ -47,7 +47,8 @@ from .drivers import (
     driver_for,
     session_id_from,
 )
-from .ledger import LedgerEntry, append_ledger
+from .inflight import clear_inflight, list_inflight, record_inflight
+from .ledger import LedgerEntry, append_ledger, resume_hint
 from .paths import normalize_root, resolve_room, runtime_root
 from .receipt import changed_since, status_lines
 from .service import AiRoomService
@@ -201,13 +202,44 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("claude", "codex", "opencode"),
     )
     ask.add_argument("--question", required=True)
-    ask.add_argument(
+    _add_dispatch_arguments(ask)
+
+    resume = commands.add_parser(
+        "resume",
+        help="continue a dispatch that was cut short, instead of re-running it",
+    )
+    resume.add_argument(
+        "--to",
+        choices=("claude", "codex", "opencode"),
+        help="which vendor holds the session; required with --session",
+    )
+    resume.add_argument(
+        "--session",
+        metavar="SESSION_ID",
+        help="handle to continue; omit to take the newest killed dispatch",
+    )
+    resume.add_argument(
+        "--question",
+        help="what to say on resuming; defaults to 'carry on where you stopped'",
+    )
+    _add_dispatch_arguments(resume)
+    return parser
+
+
+def _add_dispatch_arguments(command: argparse.ArgumentParser) -> None:
+    """Add the options shared by ``ask`` and ``resume``.
+
+    Both drive the same dispatch, so an option that exists on one and not the
+    other would mean a resumed run silently ran under different rules than the
+    run it continues.
+    """
+    command.add_argument(
         "--related-doc",
         action="append",
         default=[],
         metavar="EXACT_PATH",
     )
-    ask.add_argument(
+    command.add_argument(
         "--permission",
         choices=PERMISSION_TIERS,
         default="read-only",
@@ -217,13 +249,52 @@ def build_parser() -> argparse.ArgumentParser:
             "directory), or full-access (no sandbox)"
         ),
     )
-    ask.add_argument("--model", metavar="MODEL")
-    ask.add_argument("--cwd", metavar="DIR", help="which project to dispatch against; the sub-agent runs in the room root selected by this path")
-    ask.add_argument("--timeout", type=float, default=300.0, metavar="SECONDS")
-    ask.add_argument("--permission-mode", dest="permission_mode", metavar="MODE")
-    ask.add_argument("--sandbox", metavar="MODE")
-    ask.add_argument("--no-ledger", action="store_true")
-    return parser
+    command.add_argument("--model", metavar="MODEL")
+    command.add_argument("--cwd", metavar="DIR", help="which project to dispatch against; the sub-agent runs in the room root selected by this path")
+    command.add_argument(
+        "--timeout",
+        type=float,
+        default=_env_seconds("AI_ROOM_TIMEOUT", 300.0),
+        metavar="SECONDS",
+        help=(
+            "how long the sub-agent may stay SILENT (default 300, or "
+            "$AI_ROOM_TIMEOUT); any output resets it, so a sub-agent that is "
+            "still working is never killed"
+        ),
+    )
+    command.add_argument(
+        "--max-runtime",
+        dest="max_runtime",
+        type=float,
+        default=_env_seconds("AI_ROOM_MAX_RUNTIME", 3600.0),
+        metavar="SECONDS",
+        help=(
+            "hard cap on total run time regardless of output "
+            "(default 3600, or $AI_ROOM_MAX_RUNTIME)"
+        ),
+    )
+    command.add_argument("--permission-mode", dest="permission_mode", metavar="MODE")
+    command.add_argument("--sandbox", metavar="MODE")
+    command.add_argument("--no-ledger", action="store_true")
+
+
+def _env_seconds(name: str, fallback: float) -> float:
+    """Read a seconds budget from the environment, ignoring nonsense.
+
+    These two budgets have to be settable per machine, because the useful
+    value depends on the caller's own shell timeout -- which is a property of
+    which CLI is driving ai-room, not of ai-room.  A malformed or non-positive
+    value falls back rather than raising: a typo in a machine-wide environment
+    variable must not make every dispatch fail.
+    """
+    raw = os.environ.get(name)
+    if not raw:
+        return fallback
+    try:
+        value = float(raw)
+    except ValueError:
+        return fallback
+    return value if value > 0 else fallback
 
 
 def main(
@@ -258,20 +329,22 @@ def main(
     registry: BindingRegistry | None = None
     service: AiRoomService | None = None
     try:
-        if arguments.command == "ask":
+        if arguments.command in _DISPATCH_COMMANDS:
             ask_cwd = Path(arguments.cwd) if arguments.cwd else active_cwd
             room = resolve_room(ask_cwd)
             try:
                 sender = detect_current_session(active_environ).agent
             except SessionDetectionError:
                 sender = None
-            result = _command_ask(arguments, room.root, sender)
+            result = _DISPATCH_COMMANDS[arguments.command](
+                arguments, room.root, sender
+            )
             ok = bool(result.get("ok"))
             _write_json(
                 output,
                 {
                     "ok": ok,
-                    "command": "ask",
+                    "command": arguments.command,
                     "room": room.room_id,
                     "result": result,
                 },
@@ -720,25 +793,133 @@ def _command_ask(
     ``sender`` is None when the caller could not be identified: ask is a
     mailbox-less command and must not be blocked by session detection.
     """
-    target = arguments.to
+    # claude is the only vendor that lets the handle be chosen up front. Doing
+    # so means a run killed before it emits anything is still resumable, which
+    # codex and opencode cannot offer -- their ids only exist once they speak.
+    preassigned = str(uuid.uuid4()) if arguments.to == "claude" else None
+    return _dispatch(
+        arguments,
+        root,
+        sender,
+        target=arguments.to,
+        question=arguments.question,
+        preassigned=preassigned,
+        resume_session=None,
+    )
+
+
+#: What a resumed sub-agent is told when the caller has nothing to add.  It has
+#: to say "carry on", not restate the task: the sub-agent already holds the
+#: original question, and repeating it invites a restart from scratch, which is
+#: the exact waste resuming exists to avoid.
+_RESUME_PROMPT = (
+    "Continue the task from this conversation where you stopped. "
+    "Do not start over and do not repeat work already done; "
+    "pick up at the next unfinished step and report the result."
+)
+
+
+def _command_resume(
+    arguments: argparse.Namespace,
+    root: Path,
+    sender: AgentName | None,
+) -> dict[str, object]:
+    """Continue a dispatch that was cut short rather than paying for it twice.
+
+    A killed run is the most expensive failure there is: the turn was billed in
+    full and produced nothing the caller can use.  Re-dispatching the same task
+    bills it a second time, so continuing the existing session is the default
+    move and this command exists to make it a single call.
+    """
+    target, session_id, question = _resume_target(arguments, root)
+    return _dispatch(
+        arguments,
+        root,
+        sender,
+        target=target,
+        question=question,
+        preassigned=None,
+        resume_session=session_id,
+    )
+
+
+def _resume_target(
+    arguments: argparse.Namespace,
+    root: Path,
+) -> tuple[str, str, str]:
+    """Decide which session to continue and what to say to it."""
+    question = arguments.question or _RESUME_PROMPT
+    if arguments.session:
+        if not arguments.to:
+            raise CliOperationalError(
+                "resume_agent_required",
+                "--session needs --to claude|codex|opencode: a handle does not "
+                "say which vendor issued it.",
+            )
+        return arguments.to, arguments.session, question
+    candidates = list_inflight(root)
+    if arguments.to:
+        candidates = [run for run in candidates if run.agent == arguments.to]
+    if not candidates:
+        raise CliOperationalError(
+            "no_inflight_run",
+            "No dispatch is recorded as cut short in this room. Pass --to and "
+            "--session with a handle from .ai-room/ledger.md to resume an "
+            "older one.",
+        )
+    run = candidates[0]
+    return run.agent, run.session_id, question
+
+
+def _dispatch(
+    arguments: argparse.Namespace,
+    root: Path,
+    sender: AgentName | None,
+    *,
+    target: str,
+    question: str,
+    preassigned: str | None,
+    resume_session: str | None,
+) -> dict[str, object]:
+    """Run one sub-agent, whether it is a new task or a continued one."""
     related_docs = normalize_exact_paths(
         root,
         (Path(value) for value in arguments.related_doc),
     )
-    # claude is the only vendor that lets the handle be chosen up front. Doing
-    # so means a run killed before it emits anything is still resumable, which
-    # codex and opencode cannot offer -- their ids only exist once they speak.
-    preassigned = str(uuid.uuid4()) if target == "claude" else None
+    inflight_path: list[Path] = []
+
+    def remember(session_id: str) -> None:
+        # Written while the sub-agent is still talking, because the process may
+        # be killed from outside and then nothing later in this function runs.
+        if arguments.no_ledger:
+            return
+        try:
+            inflight_path.append(
+                record_inflight(
+                    root,
+                    agent=target,
+                    session_id=session_id,
+                    question=question,
+                    cwd=root,
+                )
+            )
+        except OSError:
+            # Bookkeeping must never take down a dispatch that is working.
+            pass
+
     request = DriverRequest(
-        question=arguments.question,
+        question=question,
         cwd=root,
         permission=arguments.permission,
         model=arguments.model,
         timeout=arguments.timeout,
+        max_runtime=arguments.max_runtime,
         permission_mode=arguments.permission_mode,
         sandbox=arguments.sandbox,
         related_docs=related_docs,
         session_id=preassigned,
+        resume_session=resume_session,
+        on_session_id=remember,
     )
     driver = driver_for(target)
     # The receipt is taken in the sub-agent's own working directory, not the
@@ -749,24 +930,20 @@ def _command_ask(
     try:
         result = driver.invoke(request)
     except DriverTimeout as error:
-        # The turn was still paid for, so recover the session id from whatever
-        # the sub-agent emitted before it was killed, falling back to the id we
-        # chose for it.  Only on this path: the process definitely ran, whereas
-        # a DriverError may mean the CLI never started, and recording a handle
-        # that resumes nothing is worse than recording none.
-        _record_ledger(
+        return _timed_out(
             arguments,
             root,
-            target,
-            related_docs,
-            request,
-            exit_code=-1,
-            status="timeout",
-            session_id=session_id_from(error.stdout) or preassigned,
-            changed_files=changed_since(before, status_lines(workdir)),
-            sender=sender,
+            sender,
+            target=target,
+            request=request,
+            related_docs=related_docs,
+            error=error,
+            driver=driver,
+            preassigned=preassigned,
+            resume_session=resume_session,
+            changed=changed_since(before, status_lines(workdir)),
+            inflight=inflight_path,
         )
-        raise
     except DriverError:
         _record_ledger(
             arguments,
@@ -780,6 +957,7 @@ def _command_ask(
             changed_files=changed_since(before, status_lines(workdir)),
             sender=sender,
         )
+        clear_inflight(inflight_path[0] if inflight_path else None)
         raise
 
     changed = changed_since(before, status_lines(workdir))
@@ -797,17 +975,105 @@ def _command_ask(
         sender=sender,
         result=result,
     )
+    # The run reported back, so it is not an orphan any more.
+    clear_inflight(inflight_path[0] if inflight_path else None)
     return {
         "ok": result.ok,
         "agent": target,
+        "status": status,
         "sender": None if sender is None else sender.value,
         "session_id": result.session_id,
+        "resumed_from": resume_session,
         "exit_code": result.exit_code,
         "text": result.text,
         "stderr": result.stderr,
         "changed_files": list(changed),
+        "resume_command": _resume_invocation(target, result.session_id, root),
         "ledger": None if ledger_path is None else str(ledger_path),
     }
+
+
+def _timed_out(
+    arguments: argparse.Namespace,
+    root: Path,
+    sender: AgentName | None,
+    *,
+    target: str,
+    request: DriverRequest,
+    related_docs: tuple[str, ...],
+    error: DriverTimeout,
+    driver,
+    preassigned: str | None,
+    resume_session: str | None,
+    changed: tuple[str, ...],
+    inflight: list[Path],
+) -> dict[str, object]:
+    """Report a cut-short dispatch as a result, not as a bare error.
+
+    The turn was paid for in full, so everything it produced is reported: the
+    partial answer, and above all the handle needed to continue it.  Raising
+    here instead -- which is what this used to do -- left the caller holding a
+    one-line "timed out" with no way to resume, and re-dispatching the same
+    task from scratch was then the only move available to it.
+    """
+    salvaged = driver.parse_partial(error.stdout)
+    # What the sub-agent actually said wins over what we planned to call it: a
+    # vendor that ignored the preassigned handle would otherwise be resumed
+    # under an id that names nothing.
+    session_id = (
+        salvaged.session_id
+        or session_id_from(error.stdout)
+        or resume_session
+        or preassigned
+    )
+    ledger_path = _record_ledger(
+        arguments,
+        root,
+        target,
+        related_docs,
+        request,
+        exit_code=-1,
+        status="timeout",
+        session_id=session_id,
+        changed_files=changed,
+        sender=sender,
+        result=salvaged,
+    )
+    clear_inflight(inflight[0] if inflight else None)
+    resume_command = _resume_invocation(target, session_id, root)
+    return {
+        "ok": False,
+        "agent": target,
+        "status": "timeout",
+        "timeout_reason": error.reason,
+        "message": str(error),
+        "sender": None if sender is None else sender.value,
+        "session_id": session_id,
+        "resumed_from": resume_session,
+        "exit_code": -1,
+        "text": salvaged.text,
+        "stderr": error.stderr.strip(),
+        "changed_files": list(changed),
+        "resume_command": resume_command,
+        "vendor_resume_command": resume_hint(target, session_id),
+        "hint": (
+            "This turn was already billed. Continue it with resume_command; "
+            "do not re-send the same ask, which starts over and pays again."
+            if resume_command
+            else "The sub-agent was killed before it announced a handle, so "
+            "this turn cannot be continued; re-dispatching is the only option."
+        ),
+        "ledger": None if ledger_path is None else str(ledger_path),
+    }
+
+
+def _resume_invocation(target: str, session_id: str | None, root: Path) -> str | None:
+    """The exact ``ai-room resume`` call that continues this dispatch."""
+    if not session_id:
+        return None
+    return (
+        f"ai-room resume --to {target} --session {session_id} --cwd {root}"
+    )
 
 
 def _record_ledger(
@@ -850,6 +1116,13 @@ def _record_ledger(
         ),
     )
 
+
+#: The two commands that run a sub-agent instead of touching the mailbox, so
+#: they take the same early exit in main() and never require an identity.
+_DISPATCH_COMMANDS = {
+    "ask": _command_ask,
+    "resume": _command_resume,
+}
 
 _COMMANDS = {
     "join": _command_join,

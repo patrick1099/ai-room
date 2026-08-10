@@ -130,6 +130,12 @@ def test_shared_skill_contains_the_role_and_compaction_contract() -> None:
     # itself or burns a consultation round on a typo fix.
     assert "廉价劳力" in text
     assert "这件事有没有技术取舍" in text
+    # The two timeout rules that cost real money when a reader gets them wrong:
+    # re-sending buys an already-billed turn a second time, and shrinking the
+    # silence budget to dodge an outer shell gate kills sub-agents mid-thought.
+    assert "续接，绝不重发" in text
+    assert "resume_command" in text
+    assert "压小 `--timeout`" in text
 
 
 def test_shared_skill_routes_to_one_manual_per_vendor() -> None:
@@ -149,7 +155,11 @@ def test_shared_skill_routes_to_one_manual_per_vendor() -> None:
             "廉价劳力",
             "AI_ROOM_CLAUDE_SESSION_ID",
             "ai-room wait",
-            "600",
+            # The knob, not a number: the ceiling is configurable per machine,
+            # so pinning a literal value here would only pin a stale claim.
+            "BASH_MAX_TIMEOUT_MS",
+            "ai-room resume",
+            "压小 `--timeout`",
         ),
         "codex.md": (
             "先让 claude 过一遍方案",
@@ -157,6 +167,8 @@ def test_shared_skill_routes_to_one_manual_per_vendor() -> None:
             "CODEX_THREAD_ID",
             "ai-room wait",
             "timeout_ms",
+            "ai-room resume",
+            "压小 `--timeout`",
         ),
         # opencode is the executor and has no mailbox identity at all, so its
         # manual must say both rather than describe a role it cannot hold.
@@ -165,6 +177,8 @@ def test_shared_skill_routes_to_one_manual_per_vendor() -> None:
             "只能用 `ask`",
             "invalid choice: 'opencode'",
             "OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS",
+            "ai-room resume",
+            "压小 `--timeout`",
         ),
     }
     for name, required in manuals.items():
@@ -379,6 +393,23 @@ def test_existing_settings_are_backed_up_before_the_changed_file(
     assert backup_path.read_bytes() == original
 
 
+def test_hook_pins_bash_because_powershell_cannot_parse_the_command(
+    tmp_path: Path,
+) -> None:
+    """A quoted path followed by -m is a parse error in PowerShell.
+
+    The command is quoted with Windows rules so a Python under "Program Files"
+    still works, but PowerShell reads a leading quoted path as a string
+    expression and rejects the next token. Leaving the shell to Claude Code's
+    default meant the hook silently died that way whenever Git Bash was not on
+    the search path -- which is what happens when claude runs as an ai-room
+    sub-agent.
+    """
+    plan = _plan(tmp_path / "home")
+    hook = plan.session_start_group["hooks"][0]
+    assert hook["shell"] == "bash"
+
+
 def test_unicode_and_spaces_paths_install_exact_skills_and_hook(
     tmp_path: Path,
 ) -> None:
@@ -393,7 +424,9 @@ def test_unicode_and_spaces_paths_install_exact_skills_and_hook(
     )
     assert plan.session_start_group == {
         "matcher": "startup|resume|clear|compact",
-        "hooks": [{"type": "command", "command": expected_command}],
+        "hooks": [
+            {"type": "command", "command": expected_command, "shell": "bash"}
+        ],
     }
     data = json.loads(_settings_path(home).read_text(encoding="utf-8"))
     assert _ai_room_groups(data) == [plan.session_start_group]

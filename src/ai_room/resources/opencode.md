@@ -39,21 +39,32 @@
 
 `ask` 也正好是默认路径。要咨询决策者时直接跑，**不要反问用户要不要开第二个窗口**——那个模式你根本参加不了。
 
-## 头号坑：你的 shell 超时比 `ask` 的默认值还短
+## 头号坑：三道闸，性质完全不同，别搞混
 
-`ask` 是同步阻塞的，而且两道闸串在一起：
+`ask` 是同步阻塞的，路上串着三道闸：
 
-```
-你的 bash 工具超时（默认 120s）   ←  先掐死的是这一道
-ai-room --timeout（默认 300s）
-```
+| 闸 | 是什么 | 谁在管 |
+|---|---|---|
+| **你的 bash 工具超时** | **硬墙**——到点连 ai-room 进程一起杀，回执、台账全没有 | `OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS` |
+| ai-room `--timeout` | **沉默预算**——只要子 agent 还在输出就一直不掐 | `AI_ROOM_TIMEOUT` |
+| ai-room `--max-runtime` | 硬顶——不管多话，到点结束（**被有意设得比外层闸小**，好让 ai-room 先响、给出带 resume 的回执）| `AI_ROOM_MAX_RUNTIME` |
 
-**默认配置下，任何超过两分钟的派发都会先被你自己的 shell 掐掉**，而且此时 ai-room 进程被杀，连台账都可能来不及写。两条出路，任选：
+**当前各是多少跑 `ai-timeouts show`，别照抄任何文档里的数字。** 要调就 `ai-timeouts set <分钟>`，一条命令把三道闸一起改到位，别手动去动其中一个——闸之间的大小关系是有讲究的，动歪了就拿不到回执。
 
-1. 抬高全局默认：环境变量 `OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS`。
-2. 把 `--timeout` 压进你 shell 的上限之内，例如 `--timeout 100`，并接受"复杂咨询会超时"。
+**绝对不要为了"躲开 shell 超时"去压小 `--timeout`。** 它是"允许沉默多久"，不是"允许跑多久"；压小只会把**正在思考的**子 agent 误杀，而那一轮照样按整轮计费。要让长任务跑得完，该调大的是**你 bash 调用自己的 timeout**。
 
-咨询一个具体问题一般几十秒，够用。
+**opencode 独有的坑**：你的工具描述里硬编码写着"2 分钟"，不管 operator 把默认值设成多少都是那句话。别被它带着走——派长任务时**自己显式把 bash 的 timeout 传够**，不要只指望默认值，也不要随手传个 120000。
+
+咨询一个具体问题一般几十秒，够用；派真任务才需要把 timeout 拉满。
+
+## 被掐死了：续接，别重发
+
+超时那一轮**已经计过费了**，重发同一条 `ask` 是同一份钱付两次，而且第二遍照样会超时。
+
+- **ai-room 判的超时**：回执带 `status:"timeout"`、`timeout_reason`、`session_id`、已产出的 `text`、`resume_command`。**先看 `text`**——它经常已经把话说完了，那就直接用，连 resume 都不用跑；不够再跑 `resume_command`。
+- **被你自己的 shell 掐掉**：什么回执都没有。直接跑 `ai-room resume --cwd <项目根>`——session id 在子 agent 一开口时就落盘到 `.ai-room/inflight/`，ai-room 进程被杀也还在。
+- 只有一种情况该重发：回执里连 `session_id` 都没有（`resume_command` 是 `null`），说明它还没开口就被打死，没有东西可续。
+- 完整规则见 `SKILL.md` 的「超时了怎么办」。
 
 ## 咨询决策者的写法
 
@@ -70,7 +81,7 @@ ai-room ask --to claude --cwd /path/to/project \
 
 ## 读结果
 
-返回的一行 JSON 里看：`ok`（厂商自己的成败判定）、`text`（回答）、`changed_files`（回执，**不是沙箱**，见 `SKILL.md` 铁律 4）、`session_id` / `ledger`（续接用）。
+返回的一行 JSON 里看：`ok`（厂商自己的成败判定）、`status`（`ok` / `error` / `timeout`）、`text`（回答，**超时时也有**，是它已经说出来的那部分）、`changed_files`（回执，**不是沙箱**，见 `SKILL.md` 铁律 4）、`session_id` / `resume_command` / `ledger`（续接用）。
 
 各目标的档位映射见 `SKILL.md` 的「三个目标的差异」。你自己这一格要记住一条：opencode **没有第三档**，`full-access` 和 `workspace-write` 完全一样（都是 `--auto`），`read-only` 是 `--agent plan`。
 

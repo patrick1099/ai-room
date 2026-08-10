@@ -160,7 +160,19 @@ def build_install_plan(
     )
     session_start_group: dict[str, object] = {
         "matcher": _HOOK_MATCHER,
-        "hooks": [{"type": "command", "command": hook_command}],
+        # The shell is pinned rather than left to Claude Code's default,
+        # because the two shells do not agree on this command.  It is quoted
+        # with Windows rules -- a Python installed under "Program Files" needs
+        # that -- and a line starting with a quoted path is a *string
+        # expression* to PowerShell, so it fails to parse before python is
+        # ever launched: "Unexpected token '-m'".  Observed for real when
+        # claude ran as an ai-room sub-agent and Git Bash was not on the
+        # sub-process's search path, so Claude Code fell back to PowerShell.
+        # Pinning bash also makes the missing-Git-Bash case report itself
+        # instead of turning into that parse error.
+        "hooks": [
+            {"type": "command", "command": hook_command, "shell": "bash"}
+        ],
     }
     settings = normalized_home / ".claude" / "settings.json"
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")

@@ -52,7 +52,7 @@ def append_ledger(root: Path, entry: LedgerEntry) -> Path:
     """Append ``entry`` to ``<root>/.ai-room/ledger.md`` and return its path."""
     path = root / LEDGER_DIRECTORY / LEDGER_FILENAME
     path.parent.mkdir(parents=True, exist_ok=True)
-    _write_self_gitignore(path.parent)
+    write_self_gitignore(path.parent)
     block = _format_entry(entry)
     if path.exists():
         with path.open("a", encoding="utf-8") as stream:
@@ -66,7 +66,7 @@ def append_ledger(root: Path, entry: LedgerEntry) -> Path:
     return path
 
 
-def _write_self_gitignore(directory: Path) -> None:
+def write_self_gitignore(directory: Path) -> None:
     """Ignore the whole ``.ai-room`` ledger directory so it is never committed.
 
     ``.ai-room`` in a project root is used only for the ledger; the room state
@@ -101,7 +101,12 @@ def _format_entry(entry: LedgerEntry) -> str:
         timespec="seconds"
     )
     docs = ", ".join(entry.related_docs) if entry.related_docs else "(none)"
-    resume = _resume_hint(entry.agent, entry.session_id)
+    command = resume_hint(entry.agent, entry.session_id)
+    resume = (
+        f"`{command}`"
+        if command
+        else "(无会话 id，无法续接)"
+    )
     lines = [
         f"\n### {timestamp} - {entry.agent} [`{entry.status}`]",
         f"- \u72b6\u6001: {entry.status} (exit {entry.exit_code})",
@@ -135,13 +140,19 @@ def _format_entry(entry: LedgerEntry) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _resume_hint(agent: str, session_id: str | None) -> str:
+def resume_hint(agent: str, session_id: str | None) -> str | None:
+    """The vendor's own command for continuing ``session_id``, if there is one.
+
+    Kept alongside ai-room's ``resume`` for the case ai-room cannot serve: the
+    handle is still usable by hand long after the room, the ledger or ai-room
+    itself is out of the picture.
+    """
     if not session_id:
-        return "(\u65e0\u4f1a\u8bdd id\uff0c\u65e0\u6cd5\u7eed\u63a5)"
+        return None
     if agent == "claude":
-        return f"`claude -r {session_id}`"
+        return f"claude -r {session_id}"
     if agent == "codex":
-        return f"`codex exec resume {session_id}`"
+        return f"codex exec resume {session_id}"
     if agent == "opencode":
-        return f"`opencode run --session {session_id}`"
+        return f"opencode run --session {session_id}"
     return session_id

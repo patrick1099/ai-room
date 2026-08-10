@@ -234,8 +234,34 @@ ai-room ask --to opencode --permission workspace-write --related-doc Code/App/Co
   （`changed_files` 和台账里的「改动回执」），只供复核，**不影响退出码**——派活时事先并不知道
   它该动哪些文件，没有可越的界。
 - 台账写 `.ai-room/`，并自动生成 `.ai-room/.gitignore`（`*`）避免被提交进仓库。
-- 续接：`claude -r SESSION_ID`、`codex exec resume SESSION_ID`、`opencode run --session SESSION_ID`。
-  被外层掐死时 session id 也不会丢：输出是边跑边解析的，不等进程结束。
+- **`--timeout` 是"允许沉默多久"，不是"允许跑多久"**：子 agent 每吐一行（stdout 或 stderr）就把
+  死线往后推，所以还在输出的子 agent 不会被掐。封顶的是 `--max-runtime`，到点无条件结束。这两
+  道闸分开，是因为"卡住了"和"停不下来"是两种故障，用一个墙钟同时管会把正在收敛的那一轮误杀。
+- 两者的出厂默认是 **300s / 3600s**，可由环境变量 `AI_ROOM_TIMEOUT` / `AI_ROOM_MAX_RUNTIME`
+  覆盖（显式 flag 优先；变量写坏会回落默认值而不是让派发失败）。之所以做成环境变量：合适的值
+  取决于**调用方自己的 shell 超时**，那是"谁在驱动 ai-room"的属性，不是 ai-room 的属性。
+- 调整用配套脚本 **`ai-timeouts`**（`ai-timeouts show` / `ai-timeouts set <分钟>`），它把三个平台的
+  shell 闸和这两个预算一起改到位。**关键约束：硬顶必须小于外层 shell 闸**，否则先响的是外层，
+  那种死法拿不到任何回执，只能盲跑 `ai-room resume`。别手动只动其中一个。
+
+### `resume`（续接被掐断的那一轮）
+
+超时那一轮**厂商已经按整轮计费了**，重发同一条 `ask` 等于同一份钱付两次。所以超时不是报错，
+而是一个带把手的结果：`ok:false` + `status:"timeout"`，并带上 `timeout_reason`、`session_id`、
+已产出的 `text`、以及可直接跑的 `resume_command`。
+
+```powershell
+ai-room resume --to opencode --session ses_xxx --permission workspace-write --cwd .
+```
+
+- 不给 `--session` 就续接本房间**最近一个被外层掐死**的派发。子 agent 一开口，session id 就落盘
+  到 `.ai-room/inflight/`，所以哪怕整个 ai-room 进程被上层 shell 杀掉（那种情况连台账都来不及
+  写），把手也还在；正常报告结束的派发会把这条记录清掉，留下的就只有真正的孤儿。
+- 给 `--session` 时必须同时给 `--to`：一个 id 不会自报是哪家发的。
+- 其余选项与 `ask` 相同，且**不会自动继承**上一轮的档位，要照原样再给一次。
+- 兜底的厂商原生续接：`claude -r SESSION_ID`、`codex exec resume SESSION_ID`、
+  `opencode run --session SESSION_ID`。注意 `codex exec resume` 不吃 `-s` 也不吃 `-C`，档位改走
+  `-c sandbox_mode=`，工作目录沿用原会话记录的那个。
 
 回执有两条硬限制，别把它当沙箱：
 
@@ -273,6 +299,18 @@ Codex 从当前 `CODEX_THREAD_ID` 对应的 token 记录读取输入 token；Cla
 
 - `no current AI session detected`：确认命令确实在对应交互式会话的终端中运行；Codex 需要
   `CODEX_THREAD_ID`，Claude 需要 SessionStart hook 提供的两个 `AI_ROOM_CLAUDE_*` 值。
+- **Windows：SessionStart hook 报 `Unexpected token '-m'` 或 `requires bash but Git Bash was not
+  found`。** 装的 hook 命令按 Windows 规则加引号（`Program Files` 下的 Python 必须如此），而
+  PowerShell 会把"以引号路径开头的一行"当成字符串表达式，还没启动 python 就先解析失败。因此
+  hook 里钉了 `"shell": "bash"`。要让 Claude Code 在任何环境下都找得到 Git Bash，在
+  `~/.claude/settings.json` 的 `env` 里给出绝对路径：
+
+  ```json
+  "env": { "CLAUDE_CODE_GIT_BASH_PATH": "D:\\Software\\Git\\bin\\bash.exe" }
+  ```
+
+  尤其是 claude 被当作 ai-room 子 agent 跑起来时——那个子进程的搜索路径和你终端里的不一样，
+  找不到 Git Bash，hook 就整个失效（子 agent 拿不到自己的会话身份）。
 - `peer_not_joined`：先让对方窗口在同一工作树执行 `join`。
 - `room_binding_missing`：当前会话尚未加入；执行 `join`。若要换命名房间，先 `leave`。
 - `room_database_missing` 或 schema 错误：保留现场，不要自行删除数据库；先备份
