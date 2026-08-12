@@ -46,7 +46,16 @@ def _git_toplevel(cwd: Path) -> Path | None:
             cwd=cwd,
             shell=False,
             capture_output=True,
-            text=True,
+            # Git prints the worktree root as UTF-8 regardless of the console
+            # code page, while ``text=True`` would decode it with the locale
+            # default (cp936 here).  A repo path holding any non-ASCII character
+            # then raises UnicodeDecodeError inside the reader thread, leaves
+            # ``stdout`` as None, and takes down every command that resolves a
+            # room -- which is all of them.  ``surrogateescape`` carries bytes
+            # that are not valid UTF-8 through unchanged, so a path stays usable
+            # for comparison and os.path even on a machine that disagrees.
+            encoding="utf-8",
+            errors="surrogateescape",
             check=False,
         )
     except OSError:
