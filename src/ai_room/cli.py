@@ -72,9 +72,8 @@ from .workspace_guard import (
 
 
 EXIT_SUCCESS = 0
+EXIT_FAILURE = 1
 EXIT_ARGUMENT = 2
-EXIT_OPERATIONAL = 3
-EXIT_CANCEL = 130
 
 _AGENT_LABELS = {
     AgentName.CODEX: "Codex",
@@ -125,8 +124,11 @@ def build_parser() -> argparse.ArgumentParser:
     """Create the exact six-command parser."""
     parser = JsonArgumentParser(
         prog="ai-room",
-        description="Coordinate one Codex and one Claude session.",
+        description=(
+            "LLMs/agents: run 'ai-room --ai-help' for usage guidance."
+        ),
     )
+    _add_output_flags(parser)
     commands = parser.add_subparsers(
         dest="command",
         required=True,
@@ -134,10 +136,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     join = commands.add_parser("join", help="join the current room")
+    _add_output_flags(join)
     join.add_argument("agent", choices=tuple(agent.value for agent in AgentName))
     join.add_argument("--room", metavar="NAME")
 
     wait = commands.add_parser("wait", help="wait silently for one delivery")
+    _add_output_flags(wait)
     wait.add_argument(
         "--checkpoint",
         action="append",
@@ -147,6 +151,7 @@ def build_parser() -> argparse.ArgumentParser:
     wait.add_argument("--next-entry", metavar="TEXT")
 
     send = commands.add_parser("send", help="send one advisor task")
+    _add_output_flags(send)
     send.add_argument(
         "--to",
         required=True,
@@ -181,6 +186,7 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("--idempotency-key", metavar="KEY")
 
     reply = commands.add_parser("reply", help="reply to one delivered task")
+    _add_output_flags(reply)
     reply.add_argument("task_id")
     reply.add_argument(
         "--outcome",
@@ -189,13 +195,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     reply.add_argument("--message", required=True)
 
-    commands.add_parser("status", help="show room membership and active task")
-    commands.add_parser("leave", help="leave without deleting messages")
+    status = commands.add_parser("status", help="show room membership and active task")
+    _add_output_flags(status)
+    leave = commands.add_parser("leave", help="leave without deleting messages")
+    _add_output_flags(leave)
 
     ask = commands.add_parser(
         "ask",
         help="dispatch one headless sub-agent task and record it in the ledger",
     )
+    _add_output_flags(ask)
     ask.add_argument(
         "--to",
         required=True,
@@ -208,6 +217,7 @@ def build_parser() -> argparse.ArgumentParser:
         "resume",
         help="continue a dispatch that was cut short, instead of re-running it",
     )
+    _add_output_flags(resume)
     resume.add_argument(
         "--to",
         choices=("claude", "codex", "opencode"),
@@ -278,6 +288,28 @@ def _add_dispatch_arguments(command: argparse.ArgumentParser) -> None:
     command.add_argument("--no-ledger", action="store_true")
 
 
+def _add_output_flags(parser: argparse.ArgumentParser) -> None:
+    """Add the machine_only output flags accepted by every command.
+
+    ai-room is a machine-only CLI: it always prints one JSON envelope, so
+    ``--json`` and ``--format json`` are accepted for contract compatibility
+    and change nothing.  The flags are accepted at the top level and on every
+    subcommand, because an AI calling ``ai-room status --json`` must not be
+    rejected for a flag the spec says every command supports.
+    """
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="machine_only: output is always JSON (accepted for CLI-AI spec compatibility)",
+    )
+    parser.add_argument(
+        "--format",
+        choices=("json",),
+        default="json",
+        help="output format (only json is supported; equivalent to --json)",
+    )
+
+
 def _env_seconds(name: str, fallback: float) -> float:
     """Read a seconds budget from the environment, ignoring nonsense.
 
@@ -310,15 +342,17 @@ def main(
     errors = stderr or sys.stderr
     _configure_utf8(output)
     _configure_utf8(errors)
+    if _handle_ai_help(argv, output):
+        return EXIT_SUCCESS
     parser = build_parser()
     try:
         arguments = parser.parse_args(argv)
         _validate_arguments(arguments)
     except CliArgumentError as error:
-        _write_error(errors, "argument_error", str(error))
+        _write_error(errors, "E_VALIDATION", str(error))
         return EXIT_ARGUMENT
     except argparse.ArgumentError as error:
-        _write_error(errors, "argument_error", str(error))
+        _write_error(errors, "E_VALIDATION", str(error))
         return EXIT_ARGUMENT
     except SystemExit as exit_request:
         return int(exit_request.code)
@@ -339,17 +373,23 @@ def main(
             result = _DISPATCH_COMMANDS[arguments.command](
                 arguments, room.root, sender
             )
-            ok = bool(result.get("ok"))
-            _write_json(
-                output,
-                {
-                    "ok": ok,
-                    "command": arguments.command,
-                    "room": room.room_id,
-                    "result": result,
-                },
+            if result.get("ok"):
+                _write_success(
+                    output,
+                    {
+                        "command": arguments.command,
+                        "room": room.room_id,
+                        "result": result,
+                    },
+                )
+                return EXIT_SUCCESS
+            _write_dispatch_error(
+                errors,
+                arguments.command,
+                room.room_id,
+                result,
             )
-            return EXIT_SUCCESS if ok else EXIT_OPERATIONAL
+            return EXIT_FAILURE
         identity = detect_current_session(active_environ)
         requested_agent = (
             AgentName(arguments.agent)
@@ -463,10 +503,9 @@ def main(
                 "waiter_replaced",
                 "This wait was replaced by another waiter for the same session.",
             )
-        _write_json(
+        _write_success(
             output,
             {
-                "ok": True,
                 "command": arguments.command,
                 "room": room.room_id,
                 "result": result,
@@ -476,114 +515,203 @@ def main(
             service.acknowledge_delivered_reply()
         return EXIT_SUCCESS
     except _WaitInterrupted:
-        return EXIT_CANCEL
+        _write_error(
+            errors,
+            "E_INTERRUPTED",
+            "Waiting was interrupted; room membership and messages were "
+            "preserved.",
+            details={"state_preserved": True},
+            suggestion="Run ai-room wait --json when ready to continue waiting.",
+        )
+        return EXIT_FAILURE
     except KeyboardInterrupt:
         raise
     except RoomBindingMissingError:
         _write_error(
             errors,
-            "room_binding_missing",
+            "E_NOT_FOUND",
             "No room binding exists for this session; run ai-room join first.",
+            details={"reason": "room_binding_missing"},
+            suggestion="ai-room join <agent>",
         )
-        return EXIT_OPERATIONAL
+        return EXIT_FAILURE
     except RoomJoinIncompleteError:
         _write_error(
             errors,
-            "room_join_incomplete",
+            "E_VALIDATION",
             "Room join is incomplete; repeat the same ai-room join command.",
+            details={"reason": "room_join_incomplete"},
+            suggestion="ai-room join <agent>",
         )
-        return EXIT_OPERATIONAL
+        return EXIT_FAILURE
     except RoomBindingConflictError:
         _write_error(
             errors,
-            "room_binding_conflict",
+            "E_VALIDATION",
             "This session is bound to another room; leave it before joining.",
+            details={"reason": "room_binding_conflict"},
+            suggestion="ai-room leave",
         )
-        return EXIT_OPERATIONAL
+        return EXIT_FAILURE
     except RoomDatabaseMissingError:
         _write_error(
             errors,
-            "room_database_missing",
+            "E_NOT_FOUND",
             "The bound room database is missing; leave and join again.",
+            details={"reason": "room_database_missing"},
+            suggestion="ai-room leave && ai-room join <agent>",
         )
-        return EXIT_OPERATIONAL
+        return EXIT_FAILURE
     except BindingSchemaVersionError as error:
         _write_error(
             errors,
-            "binding_schema_version_unsupported",
+            "E_IO",
             str(error),
+            details={"reason": "binding_schema_version_unsupported"},
         )
-        return EXIT_OPERATIONAL
+        return EXIT_FAILURE
     except BindingDatabaseOpenError as error:
-        _write_error(errors, "binding_database_open_failed", str(error))
-        return EXIT_OPERATIONAL
+        _write_error(
+            errors,
+            "E_IO",
+            str(error),
+            details={"reason": "binding_database_open_failed"},
+        )
+        return EXIT_FAILURE
     except BindingDatabaseBusyError as error:
-        _write_error(errors, "binding_database_busy", str(error))
-        return EXIT_OPERATIONAL
+        _write_error(
+            errors,
+            "E_IO",
+            str(error),
+            details={"reason": "binding_database_busy"},
+            retryable=True,
+        )
+        return EXIT_FAILURE
     except CliArgumentError as error:
-        _write_error(errors, "argument_error", str(error))
+        _write_error(errors, "E_VALIDATION", str(error))
         return EXIT_ARGUMENT
     except PeerNotJoinedError:
         if arguments.command == "send":
             peer = AgentName(arguments.to)
             message = f"{_AGENT_LABELS[peer]} has not joined this room."
-            code = "peer_not_joined"
+            reason = "peer_not_joined"
         else:
             message = (
                 f"{_AGENT_LABELS[identity.agent]} current session is not "
                 "joined to this room."
             )
-            code = "session_not_joined"
-        _write_error(errors, code, message)
-        return EXIT_OPERATIONAL
+            reason = "session_not_joined"
+        _write_error(errors, "E_NOT_FOUND", message, details={"reason": reason})
+        return EXIT_FAILURE
     except SessionDetectionError as error:
-        _write_error(errors, "session_detection_failed", str(error))
-        return EXIT_OPERATIONAL
+        _write_error(
+            errors,
+            "E_PLATFORM",
+            str(error),
+            details={"reason": "session_detection_failed"},
+        )
+        return EXIT_FAILURE
     except ValueError as error:
-        _write_error(errors, "argument_error", str(error))
+        _write_error(errors, "E_VALIDATION", str(error))
         return EXIT_ARGUMENT
     except SchemaVersionError as error:
-        _write_error(errors, "schema_version_unsupported", str(error))
-        return EXIT_OPERATIONAL
+        _write_error(
+            errors,
+            "E_IO",
+            str(error),
+            details={"reason": "schema_version_unsupported"},
+        )
+        return EXIT_FAILURE
     except DatabaseOpenError as error:
-        _write_error(errors, "database_open_failed", str(error))
-        return EXIT_OPERATIONAL
+        _write_error(
+            errors,
+            "E_IO",
+            str(error),
+            details={"reason": "database_open_failed"},
+        )
+        return EXIT_FAILURE
     except DatabaseBusyError as error:
-        _write_error(errors, "database_busy", str(error))
-        return EXIT_OPERATIONAL
+        _write_error(
+            errors,
+            "E_IO",
+            str(error),
+            details={"reason": "database_busy"},
+            retryable=True,
+        )
+        return EXIT_FAILURE
     except MalformedMessageError as error:
-        _write_error(errors, "malformed_message", str(error))
-        return EXIT_OPERATIONAL
+        _write_error(
+            errors,
+            "E_IO",
+            str(error),
+            details={"reason": "malformed_message"},
+        )
+        return EXIT_FAILURE
     except TaskNotDeliveredError as error:
-        _write_error(errors, "task_not_delivered", str(error))
-        return EXIT_OPERATIONAL
+        _write_error(
+            errors,
+            "E_VALIDATION",
+            str(error),
+            details={"reason": "task_not_delivered"},
+            suggestion="ai-room wait --json",
+        )
+        return EXIT_FAILURE
     except TaskConflictError as error:
-        _write_error(errors, "task_conflict", str(error))
-        return EXIT_OPERATIONAL
+        _write_error(
+            errors,
+            "E_VALIDATION",
+            str(error),
+            details={"reason": "task_conflict"},
+        )
+        return EXIT_FAILURE
     except WorkspaceCaptureError as error:
         _write_error(
             errors,
-            "workspace_capture_failed",
+            "E_IO",
             f"Workspace capture failed safely: {error.reason}.",
+            details={"reason": "workspace_capture_failed"},
         )
-        return EXIT_OPERATIONAL
+        return EXIT_FAILURE
     except DriverError as error:
-        _write_error(errors, "subagent_driver_error", str(error))
-        return EXIT_OPERATIONAL
+        _write_error(
+            errors,
+            "E_EXTERNAL_TOOL",
+            str(error),
+            details={"reason": "subagent_driver_error"},
+        )
+        return EXIT_FAILURE
     except CliOperationalError as error:
-        _write_error(errors, error.code, str(error))
-        return EXIT_OPERATIONAL
+        if error.code == "no_inflight_run":
+            code, rc = "E_NOT_FOUND", EXIT_FAILURE
+        elif error.code == "waiter_replaced":
+            code, rc = "E_VALIDATION", EXIT_FAILURE
+        elif error.code == "resume_agent_required":
+            code, rc = "E_VALIDATION", EXIT_ARGUMENT
+        else:
+            code, rc = "E_INTERNAL", EXIT_FAILURE
+        _write_error(errors, code, str(error), details={"reason": error.code})
+        return rc
     except StorageError as error:
-        _write_error(errors, "storage_error", str(error))
-        return EXIT_OPERATIONAL
+        _write_error(
+            errors,
+            "E_IO",
+            str(error),
+            details={"reason": "storage_error"},
+        )
+        return EXIT_FAILURE
     except (KeyError, OSError) as error:
         message = (
             "LOCALAPPDATA is required for ai-room runtime data."
             if isinstance(error, KeyError)
             else f"Runtime operation failed: {type(error).__name__}."
         )
-        _write_error(errors, "runtime_configuration", message)
-        return EXIT_OPERATIONAL
+        _write_error(
+            errors,
+            "E_PLATFORM",
+            message,
+            details={"reason": "runtime_configuration"},
+        )
+        return EXIT_FAILURE
     finally:
         try:
             if store is not None:
@@ -678,11 +806,6 @@ def _command_wait(
             next_entry=arguments.next_entry,
         )
     except KeyboardInterrupt:
-        stderr.write(
-            "ai-room wait interrupted; room membership and messages were "
-            "preserved.\n"
-        )
-        stderr.flush()
         raise _WaitInterrupted from None
     if delivery is None:
         return None
@@ -1206,11 +1329,59 @@ def _write_error(
     stream: TextIO,
     code: str,
     message: str,
-    **details: object,
+    *,
+    details: object | None = None,
+    retryable: bool = False,
+    suggestion: str | None = None,
 ) -> None:
-    error: dict[str, object] = {"code": code, "message": message}
-    error.update(details)
-    _write_json(stream, {"ok": False, "error": error})
+    error: dict[str, object] = {
+        "code": code,
+        "message": message,
+        "retryable": retryable,
+    }
+    if details is not None:
+        error["details"] = details
+    if suggestion is not None:
+        error["suggestion"] = suggestion
+    _write_json(stream, {"ok": False, "data": None, "error": error, "meta": {}})
+
+
+def _write_success(
+    stream: TextIO,
+    data: object,
+) -> None:
+    _write_json(stream, {"ok": True, "data": data, "error": None, "meta": {}})
+
+
+def _write_dispatch_error(
+    stream: TextIO,
+    command: str,
+    room: str,
+    result: dict[str, object],
+) -> None:
+    """Report a failed or cut-short dispatch as an E_EXTERNAL_TOOL envelope.
+
+    The sub-agent (claude/codex/opencode) is an external tool: when it reports
+    failure or is killed, the exit code and every field of its receipt belong
+    in ``error.details``, and the resume command becomes the ``suggestion`` so
+    the caller can continue the billed turn instead of paying for it twice.
+    """
+    details: dict[str, object] = {"command": command, "room": room}
+    for key, value in result.items():
+        if key == "ok":
+            continue
+        details[key] = value
+    suggestion = result.get("resume_command")
+    message = result.get("message") or result.get("hint") or (
+        "sub-agent reported failure"
+    )
+    _write_error(
+        stream,
+        "E_EXTERNAL_TOOL",
+        message,
+        details=details,
+        suggestion=suggestion,
+    )
 
 
 def _write_json(stream: TextIO, value: object) -> None:
@@ -1232,3 +1403,107 @@ def _configure_utf8(stream: TextIO) -> None:
             reconfigure(encoding="utf-8")
         except (AttributeError, OSError):
             pass
+
+
+AI_HELP = """---
+name: ai-room
+description: >
+  Coordinate one Codex, one Claude, and one opencode session headlessly.
+  Dispatch a sub-agent task (ask), resume a cut-short dispatch (resume), or
+  run the mailbox protocol (join/wait/send/reply/status/leave). machine_only:
+  every command always prints one JSON envelope to stdout; failures go to
+  stderr as an envelope with error.code. Use when the user wants to consult
+  another AI, dispatch a task to opencode, or continue a killed dispatch.
+ai_help_version: 0.1.0
+tool_version: 0.1.0
+---
+
+## When to Use
+
+Use this tool when the user asks to:
+- 把方案交给对面那个 peer 审（你是 claude 就问 codex，是 codex 就问 claude）
+- 派一个边界清楚的任务给 opencode 执行
+- 续接一个被掐断的派发（超时的正确动作是 resume，不是重发同一条 ask）
+- 开两个窗口互当顾问（信箱模式 join/wait/send/reply）
+
+Do NOT use for:
+- 需要两侧同时在线才能进行的实时对话（那是信箱模式，ask 是无头的）
+- 让决策者（peer）动手改代码——决策者只出判断，保持 read-only
+
+## Quick Reference
+
+- **咨询决策者（只读）:** `ai-room ask --to codex --question "..." --cwd <project>`
+- **派 opencode 执行:** `ai-room ask --to opencode --permission workspace-write --question "..." --cwd <project>`
+- **续接被掐断的派发:** `ai-room resume --to codex --session <id> --cwd <project>`
+
+## Command Reference
+
+- `ask --to claude|codex|opencode --question TEXT [--related-doc PATH]... [--permission read-only|workspace-write|full-access] [--cwd DIR] [--timeout SEC] [--max-runtime SEC] [--no-ledger]`
+  - 必填：`--to`、`--question`。默认 `read-only`。
+  - 成功：rc 0，stdout 信封 `data.result` 含 agent/status/text/changed_files/session_id/resume_command/ledger。
+  - 失败或超时：rc 1，stderr 信封 `error.code=E_EXTERNAL_TOOL`，`error.details` 含完整结果，
+    `error.suggestion` 是可续接的 `ai-room resume ...` 命令。
+- `resume [--to ...] [--session ID] [--question TEXT] ...`
+  - 不给 --session 续接本房间最近一个被掐断的派发；给 --session 必须同时给 --to。
+- `join AGENT [--room NAME]` / `wait` / `send` / `reply` / `status` / `leave`（信箱协议，见 SKILL.md）
+
+## Input / Output
+
+- 时间戳一律 ISO 8601；字段 snake_case；缺失用 null。
+- `--json` 与 `--format json` 等价接受；本工具 machine_only，默认恒为 JSON，两者都是 no-op。
+- stdout 只有一行 JSON 信封；日志/进度/错误信封一律 stderr。
+
+## Side Effects & Safety
+
+- `ask` / `resume`：启动一个真实的子 agent（claude/codex/opencode），**按整轮计费**。
+  超时那一轮已计费——续接（resume），绝不重发。写台账 `.ai-room/ledger.md`（`--no-ledger` 关闭）。
+- `join/wait/send/reply/status/leave`：只读写 `%LOCALAPPDATA%/ai-room` 的房间库，不碰项目文件。
+- `wait` 是故意阻塞且静默的；中断只结束本次等待，不丢任务、不离开房间（E_INTERRUPTED，可安全重跑）。
+- 默认只读档：`--permission read-only` 时子 agent 不能写任何文件。
+
+## Exit Codes
+
+| 退出码 | 含义 |
+|---|---|
+| 0 | 成功 |
+| 1 | 运行/业务失败（含 E_INTERNAL 与可捕获中断 E_INTERRUPTED） |
+| 2 | 参数/用法错误（E_VALIDATION） |
+
+## Errors & Recovery
+
+| code | 含义 | 恢复 |
+|---|---|---|
+| `E_VALIDATION` | 参数/用法错误（rc2） | 修参数；resume --session 需同时给 --to |
+| `E_NOT_FOUND` | 房间/绑定/成员/任务不存在 | 先 join 或先 send |
+| `E_IO` | 数据库打开/读写/schema 失败 | leave 后重新 join |
+| `E_PLATFORM` | 会话身份探测失败/LOCALAPPDATA 缺失 | 在对应 AI CLI 的会话环境内运行 |
+| `E_EXTERNAL_TOOL` | 子 agent 驱动失败或派发失败/超时 | 用 error.details.resume_command 续接 |
+| `E_INTERRUPTED` | wait 被中断 | 状态已保全，重跑 wait |
+| `E_INTERNAL` | 未预期内部错误 | 报 bug |
+
+❌ 错：`ai-room ask --to codex --session abc`（resume 的参数）
+✅ 对：`ai-room resume --to codex --session abc --cwd <project>`
+"""
+
+
+def _handle_ai_help(argv: Sequence[str] | None, output: TextIO) -> bool:
+    """Eagerly answer ``--ai-help`` before argument parsing.
+
+    The scan runs on the raw argv so that a required subcommand cannot block
+    the bare ``--ai-help`` call, and it respects ``--`` as the end of options:
+    ``ai-room -- --ai-help`` must treat ``--ai-help`` as an operand.
+    """
+    if argv is None:
+        argv = sys.argv[1:]
+    stopped = False
+    for token in argv:
+        if stopped:
+            break
+        if token == "--":
+            stopped = True
+            continue
+        if token == "--ai-help":
+            output.write(AI_HELP)
+            output.flush()
+            return True
+    return False

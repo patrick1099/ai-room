@@ -123,7 +123,7 @@ def test_invalid_choice_is_json_argument_error(
     assert completed.stdout == ""
     error = _assert_one_json_object(completed.stderr)
     assert error["ok"] is False
-    assert error["error"]["code"] == "argument_error"
+    assert error["error"]["code"] == "E_VALIDATION"
     assert "Traceback" not in completed.stderr
 
 
@@ -151,7 +151,7 @@ def test_document_review_requires_related_document(
 
     assert completed.returncode == 2
     error = _assert_one_json_object(completed.stderr)
-    assert error["error"]["code"] == "argument_error"
+    assert error["error"]["code"] == "E_VALIDATION"
     assert "--related-doc" in error["error"]["message"]
 
 
@@ -178,7 +178,7 @@ def test_non_document_kind_rejects_writable_document(
 
     assert completed.returncode == 2
     error = _assert_one_json_object(completed.stderr)
-    assert error["error"]["code"] == "argument_error"
+    assert error["error"]["code"] == "E_VALIDATION"
     assert "--writable-doc" in error["error"]["message"]
 
 
@@ -193,9 +193,9 @@ def test_join_status_and_leave_emit_stable_status_wording(cli_workspace) -> None
     joined_json = _assert_one_json_object(joined.stdout)
     status_json = _assert_one_json_object(status.stdout)
     left_json = _assert_one_json_object(left.stdout)
-    assert joined_json["command"] == "join"
-    assert joined_json["result"]["agent"] == "codex"
-    assert status_json["result"]["members"] == {
+    assert joined_json["data"]["command"] == "join"
+    assert joined_json["data"]["result"]["agent"] == "codex"
+    assert status_json["data"]["result"]["members"] == {
         "codex": {
             "status": "joined_not_waiting",
             "message": "Codex has joined but is not waiting.",
@@ -205,7 +205,7 @@ def test_join_status_and_leave_emit_stable_status_wording(cli_workspace) -> None
             "message": "Claude has not joined this room.",
         },
     }
-    assert left_json["result"] == {
+    assert left_json["data"]["result"] == {
         "agent": "codex",
         "status": "left",
         "message": "Codex left this room; messages were preserved.",
@@ -229,15 +229,14 @@ def test_peer_not_joined_is_stable_actionable_error(cli_workspace) -> None:
         "选 A 还是 B？",
     )
 
-    assert completed.returncode == 3
+    assert completed.returncode == 1
     assert completed.stdout == ""
-    assert _assert_one_json_object(completed.stderr) == {
-        "ok": False,
-        "error": {
-            "code": "peer_not_joined",
-            "message": "Claude has not joined this room.",
-        },
-    }
+    envelope = _assert_one_json_object(completed.stderr)
+    assert envelope["ok"] is False
+    assert envelope["data"] is None
+    assert envelope["meta"] == {}
+    assert envelope["error"]["code"] == "E_NOT_FOUND"
+    assert envelope["error"]["details"]["reason"] == "peer_not_joined"
 
 
 def test_unicode_and_repeated_exact_paths_round_trip_through_subprocess(
@@ -275,10 +274,10 @@ def test_unicode_and_repeated_exact_paths_round_trip_through_subprocess(
     assert sent.returncode == waited.returncode == 0
     sent_json = _assert_one_json_object(sent.stdout)
     waited_json = _assert_one_json_object(waited.stdout)
-    assert sent_json["result"]["kind"] == "design_review"
-    assert waited_json["result"] == {
-        "message_id": waited_json["result"]["message_id"],
-        "task_id": sent_json["result"]["task_id"],
+    assert sent_json["data"]["result"]["kind"] == "design_review"
+    assert waited_json["data"]["result"] == {
+        "message_id": waited_json["data"]["result"]["message_id"],
+        "task_id": sent_json["data"]["result"]["task_id"],
         "kind": "design_review",
         "sender": "codex",
         "recipient": "claude",
@@ -295,10 +294,10 @@ def test_unicode_and_repeated_exact_paths_round_trip_through_subprocess(
         },
         "next_entry": "继续实现命令行",
         "reply": {
-            "task_id": sent_json["result"]["task_id"],
+            "task_id": sent_json["data"]["result"]["task_id"],
             "command": (
                 "ai-room reply "
-                f"{sent_json['result']['task_id']} --outcome "
+                f"{sent_json['data']['result']['task_id']} --outcome "
                 "done|blocked|compact-ready|checkpoint-needed --message TEXT"
             ),
         },
@@ -330,15 +329,15 @@ def test_named_room_continues_through_all_commands_without_room_option(
     codex_join_json = _assert_one_json_object(codex_join.stdout)
     assert codex_join.returncode == claude_join.returncode == 0
     assert (
-        _assert_one_json_object(claude_join.stdout)["room"]
-        == codex_join_json["room"]
+        _assert_one_json_object(claude_join.stdout)["data"]["room"]
+        == codex_join_json["data"]["room"]
     )
 
     status = _run_cli(workspace, codex_env, "status")
     status_json = _assert_one_json_object(status.stdout)
     assert status.returncode == 0
-    assert status_json["room"] == codex_join_json["room"]
-    assert status_json["result"]["members"]["claude"]["status"] == (
+    assert status_json["data"]["room"] == codex_join_json["data"]["room"]
+    assert status_json["data"]["result"]["members"]["claude"]["status"] == (
         "joined_not_waiting"
     )
 
@@ -353,9 +352,9 @@ def test_named_room_continues_through_all_commands_without_room_option(
         "--question",
         "命名房间继续吗？",
     )
-    task_id = _assert_one_json_object(sent.stdout)["result"]["task_id"]
+    task_id = _assert_one_json_object(sent.stdout)["data"]["result"]["task_id"]
     delivered = _run_cli(workspace, claude_env, "wait")
-    assert _assert_one_json_object(delivered.stdout)["result"]["task_id"] == task_id
+    assert _assert_one_json_object(delivered.stdout)["data"]["result"]["task_id"] == task_id
     replied = _run_cli(
         workspace,
         claude_env,
@@ -368,10 +367,10 @@ def test_named_room_continues_through_all_commands_without_room_option(
     )
     assert replied.returncode == 0
     response = _run_cli(workspace, codex_env, "wait")
-    assert _assert_one_json_object(response.stdout)["result"]["message"] == "继续"
+    assert _assert_one_json_object(response.stdout)["data"]["result"]["message"] == "继续"
 
     room_database = (
-        runtime_root(codex_env) / f"{codex_join_json['room']}.sqlite3"
+        runtime_root(codex_env) / f"{codex_join_json['data']['room']}.sqlite3"
     )
     assert room_database.exists()
     assert _run_cli(workspace, claude_env, "leave").returncode == 0
@@ -384,7 +383,7 @@ def test_named_room_continues_through_all_commands_without_room_option(
         history.close()
 
     default_room = resolve_room(workspace)
-    assert default_room.room_id != codex_join_json["room"]
+    assert default_room.room_id != codex_join_json["data"]["room"]
     assert not (
         runtime_root(codex_env) / f"{default_room.room_id}.sqlite3"
     ).exists()
@@ -406,17 +405,17 @@ def test_default_room_uses_binding_and_fresh_session_does_not_inherit_it(
     )
     missing = _run_cli(workspace, fresh_env, "status")
 
-    assert missing.returncode == 3
+    assert missing.returncode == 1
     assert missing.stdout == ""
-    assert _assert_one_json_object(missing.stderr)["error"] == {
-        "code": "room_binding_missing",
-        "message": "No room binding exists for this session; run ai-room join first.",
-    }
+    error = _assert_one_json_object(missing.stderr)["error"]
+    assert error["code"] == "E_NOT_FOUND"
+    assert error["details"]["reason"] == "room_binding_missing"
+    assert "run ai-room join first" in error["message"]
     assert not (
         runtime_root(codex_env)
         / f"{resolve_room(workspace, 'unused').room_id}.sqlite3"
     ).exists()
-    assert joined_json["room"] == resolve_room(workspace).room_id
+    assert joined_json["data"]["room"] == resolve_room(workspace).room_id
 
 
 def test_sessions_on_same_root_keep_different_named_rooms_isolated(
@@ -449,17 +448,17 @@ def test_sessions_on_same_root_keep_different_named_rooms_isolated(
         "--room",
         "room-b",
     )
-    first_room = _assert_one_json_object(first.stdout)["room"]
-    second_room = _assert_one_json_object(second.stdout)["room"]
+    first_room = _assert_one_json_object(first.stdout)["data"]["room"]
+    second_room = _assert_one_json_object(second.stdout)["data"]["room"]
 
     assert first.returncode == second.returncode == 0
     assert first_room != second_room
     assert _assert_one_json_object(
         _run_cli(workspace, first_env, "status").stdout
-    )["room"] == first_room
+    )["data"]["room"] == first_room
     assert _assert_one_json_object(
         _run_cli(workspace, second_env, "status").stdout
-    )["room"] == second_room
+    )["data"]["room"] == second_room
 
 
 def test_binding_conflict_requires_leave_before_named_room_rejoin(
@@ -487,9 +486,9 @@ def test_binding_conflict_requires_leave_before_named_room_rejoin(
         "second",
     )
 
-    assert conflict.returncode == 3
+    assert conflict.returncode == 1
     assert _assert_one_json_object(conflict.stderr)["error"]["code"] == (
-        "room_binding_conflict"
+        "E_VALIDATION"
     )
     assert _run_cli(workspace, codex_env, "leave").returncode == 0
     replacement = _run_cli(
@@ -501,7 +500,7 @@ def test_binding_conflict_requires_leave_before_named_room_rejoin(
         "second",
     )
     assert replacement.returncode == 0
-    assert _assert_one_json_object(replacement.stdout)["room"] == (
+    assert _assert_one_json_object(replacement.stdout)["data"]["room"] == (
         resolve_room(workspace, "second").room_id
     )
 
@@ -528,9 +527,9 @@ def test_pending_binding_is_actionable_and_same_join_repairs_it(
         registry.close()
 
     incomplete = _run_cli(workspace, codex_env, "status")
-    assert incomplete.returncode == 3
+    assert incomplete.returncode == 1
     assert _assert_one_json_object(incomplete.stderr)["error"]["code"] == (
-        "room_join_incomplete"
+        "E_VALIDATION"
     )
 
     repaired = _run_cli(
@@ -557,17 +556,17 @@ def test_missing_bound_room_database_is_not_recreated(
         "--room",
         "ephemeral",
     )
-    room_id = _assert_one_json_object(joined.stdout)["room"]
+    room_id = _assert_one_json_object(joined.stdout)["data"]["room"]
     database = runtime_root(codex_env) / f"{room_id}.sqlite3"
     database.unlink()
 
     status = _run_cli(workspace, codex_env, "status")
 
-    assert status.returncode == 3
-    assert _assert_one_json_object(status.stderr)["error"] == {
-        "code": "room_database_missing",
-        "message": "The bound room database is missing; leave and join again.",
-    }
+    assert status.returncode == 1
+    error = _assert_one_json_object(status.stderr)["error"]
+    assert error["code"] == "E_NOT_FOUND"
+    assert error["details"]["reason"] == "room_database_missing"
+    assert "leave and join again" in error["message"]
     assert not database.exists()
     left = _run_cli(workspace, codex_env, "leave")
     assert left.returncode == 0
@@ -588,9 +587,9 @@ def test_corrupt_binding_registry_is_actionable_and_not_rebuilt(
 
     status = _run_cli(workspace, environ, "status")
 
-    assert status.returncode == 3
+    assert status.returncode == 1
     error = _assert_one_json_object(status.stderr)["error"]
-    assert error["code"] == "binding_database_open_failed"
+    assert error["code"] == "E_IO"
     assert str(tmp_path) not in error["message"]
     assert registry.read_bytes() == original
 
@@ -618,9 +617,9 @@ def test_unsupported_binding_registry_schema_is_stable_json(
 
     status = _run_cli(workspace, environ, "status")
 
-    assert status.returncode == 3
+    assert status.returncode == 1
     error = _assert_one_json_object(status.stderr)["error"]
-    assert error["code"] == "binding_schema_version_unsupported"
+    assert error["code"] == "E_IO"
     assert "99" in error["message"]
     assert registry.read_bytes() == original
 
@@ -659,9 +658,9 @@ def test_weakened_v1_binding_schema_is_operational_json(
 
     status = _run_cli(workspace, environ, "status")
 
-    assert status.returncode == 3
+    assert status.returncode == 1
     error = _assert_one_json_object(status.stderr)["error"]
-    assert error["code"] == "binding_database_open_failed"
+    assert error["code"] == "E_IO"
 
 
 def test_invalid_persisted_binding_state_is_operational_json(
@@ -682,9 +681,9 @@ def test_invalid_persisted_binding_state_is_operational_json(
 
     status = _run_cli(workspace, codex_env, "status")
 
-    assert status.returncode == 3
+    assert status.returncode == 1
     error = _assert_one_json_object(status.stderr)["error"]
-    assert error["code"] == "binding_database_open_failed"
+    assert error["code"] == "E_IO"
 
 
 def test_unexpected_binding_trigger_is_operational_json_without_write(
@@ -713,9 +712,9 @@ def test_unexpected_binding_trigger_is_operational_json_without_write(
 
     status = _run_cli(workspace, codex_env, "status")
 
-    assert status.returncode == 3
+    assert status.returncode == 1
     error = _assert_one_json_object(status.stderr)["error"]
-    assert error["code"] == "binding_database_open_failed"
+    assert error["code"] == "E_IO"
     check = sqlite3.connect(registry)
     try:
         assert check.execute(
@@ -750,9 +749,9 @@ def test_invalid_persisted_room_name_is_operational_json(
 
     status = _run_cli(workspace, codex_env, "status")
 
-    assert status.returncode == 3
+    assert status.returncode == 1
     error = _assert_one_json_object(status.stderr)["error"]
-    assert error["code"] == "binding_database_open_failed"
+    assert error["code"] == "E_IO"
 
 
 @pytest.mark.parametrize(
@@ -776,11 +775,11 @@ def test_join_rejects_invalid_room_name_without_reserving_binding(
 
     assert joined.returncode == 2
     error = _assert_one_json_object(joined.stderr)["error"]
-    assert error["code"] == "argument_error"
+    assert error["code"] == "E_VALIDATION"
     status = _run_cli(workspace, codex_env, "status")
-    assert status.returncode == 3
+    assert status.returncode == 1
     assert _assert_one_json_object(status.stderr)["error"]["code"] == (
-        "room_binding_missing"
+        "E_NOT_FOUND"
     )
 
 
@@ -799,7 +798,7 @@ def test_guard_violation_downgrades_the_reply_to_blocked(cli_workspace) -> None:
         "--question",
         "只做决定",
     )
-    task_id = _assert_one_json_object(sent.stdout)["result"]["task_id"]
+    task_id = _assert_one_json_object(sent.stdout)["data"]["result"]["task_id"]
     assert _run_cli(workspace, claude_env, "wait").returncode == 0
     (workspace / "source.py").write_text("not allowed\n", encoding="utf-8")
 
@@ -816,7 +815,7 @@ def test_guard_violation_downgrades_the_reply_to_blocked(cli_workspace) -> None:
 
     assert completed.returncode == 0
     assert completed.stderr == ""
-    result = _assert_one_json_object(completed.stdout)["result"]
+    result = _assert_one_json_object(completed.stdout)["data"]["result"]
     assert result["state"] == "blocked"
     assert result["guard_violations"] == ["source.py"]
 
@@ -836,7 +835,7 @@ def test_reply_without_wait_reports_task_not_delivered(cli_workspace) -> None:
         "--question",
         "只做决定",
     )
-    task_id = _assert_one_json_object(sent.stdout)["result"]["task_id"]
+    task_id = _assert_one_json_object(sent.stdout)["data"]["result"]["task_id"]
 
     completed = _run_cli(
         workspace,
@@ -849,9 +848,9 @@ def test_reply_without_wait_reports_task_not_delivered(cli_workspace) -> None:
         "采用方案甲",
     )
 
-    assert completed.returncode == 3
+    assert completed.returncode == 1
     error = _assert_one_json_object(completed.stderr)["error"]
-    assert error["code"] == "task_not_delivered"
+    assert error["code"] == "E_VALIDATION"
     assert "ai-room wait" in error["message"]
     assert _run_cli(workspace, claude_env, "wait").returncode == 0
     retried = _run_cli(
@@ -865,10 +864,10 @@ def test_reply_without_wait_reports_task_not_delivered(cli_workspace) -> None:
         "采用方案甲",
     )
     assert retried.returncode == 0
-    assert _assert_one_json_object(retried.stdout)["result"]["state"] == "done"
+    assert _assert_one_json_object(retried.stdout)["data"]["result"]["state"] == "done"
 
 
-def test_keyboard_interrupt_during_wait_returns_130_only(
+def test_keyboard_interrupt_during_wait_is_interrupted_envelope(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -889,6 +888,8 @@ def test_keyboard_interrupt_during_wait_returns_130_only(
     )
     stdout.seek(0)
     stdout.truncate(0)
+    stderr.seek(0)
+    stderr.truncate(0)
 
     def interrupt(self, cancel_event, checkpoint_docs=(), *, next_entry=None):
         raise KeyboardInterrupt
@@ -903,12 +904,13 @@ def test_keyboard_interrupt_during_wait_returns_130_only(
         stderr=stderr,
     )
 
-    assert result == 130
+    assert result == 1
     assert stdout.getvalue() == ""
-    assert stderr.getvalue() == (
-        "ai-room wait interrupted; room membership and messages were "
-        "preserved.\n"
-    )
+    envelope = _assert_one_json_object(stderr.getvalue())
+    assert envelope["ok"] is False
+    assert envelope["data"] is None
+    assert envelope["error"]["code"] == "E_INTERRUPTED"
+    assert envelope["error"]["details"]["state_preserved"] is True
     import importlib
 
     bindings = importlib.import_module("ai_room.bindings")
@@ -986,7 +988,7 @@ def test_wait_rejects_non_exact_checkpoint_before_blocking(
     assert result == 2
     assert stdout.getvalue() == ""
     error = _assert_one_json_object(stderr.getvalue())
-    assert error["error"]["code"] == "argument_error"
+    assert error["error"]["code"] == "E_VALIDATION"
 
 
 def test_path_argument_error_redacts_the_user_home(
@@ -1029,7 +1031,7 @@ def test_path_argument_error_redacts_the_user_home(
 
     assert result == 2
     error = _assert_one_json_object(stderr.getvalue())
-    assert error["error"]["code"] == "argument_error"
+    assert error["error"]["code"] == "E_VALIDATION"
     assert str(Path.home()) not in error["error"]["message"]
 
 
@@ -1115,7 +1117,7 @@ def test_wait_acknowledges_the_reply_it_delivered(cli_workspace) -> None:
         "--question",
         "选方案 A 还是 B？",
     )
-    task_id = _assert_one_json_object(sent.stdout)["result"]["task_id"]
+    task_id = _assert_one_json_object(sent.stdout)["data"]["result"]["task_id"]
     assert _run_cli(workspace, claude_env, "wait").returncode == 0
     assert (
         _run_cli(
@@ -1134,9 +1136,9 @@ def test_wait_acknowledges_the_reply_it_delivered(cli_workspace) -> None:
     delivered = _assert_one_json_object(
         _run_cli(workspace, codex_env, "wait").stdout
     )
-    message_id = delivered["result"]["message_id"]
+    message_id = delivered["data"]["result"]["message_id"]
 
-    room_database = runtime_root(codex_env) / f"{joined['room']}.sqlite3"
+    room_database = runtime_root(codex_env) / f"{joined['data']['room']}.sqlite3"
     connection = sqlite3.connect(room_database)
     try:
         row = connection.execute(

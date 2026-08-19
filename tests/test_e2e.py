@@ -214,9 +214,9 @@ def test_two_agent_chinese_round_trip_uses_real_subprocesses(
     finally:
         _stop(advisor_wait)
 
-    task_id = sent["result"]["task_id"]  # type: ignore[index]
-    assert delivered["result"]["task_id"] == task_id  # type: ignore[index]
-    assert delivered["result"]["question"] == "这里应该选方案 A 还是 B？"  # type: ignore[index]
+    task_id = sent["data"]["result"]["task_id"]  # type: ignore[index]
+    assert delivered["data"]["result"]["task_id"] == task_id  # type: ignore[index]
+    assert delivered["data"]["result"]["question"] == "这里应该选方案 A 还是 B？"  # type: ignore[index]
     _run_ok(
         workspace,
         "claude",
@@ -228,8 +228,8 @@ def test_two_agent_chinese_round_trip_uses_real_subprocesses(
         "采用方案 A，并记录取舍。",
     )
     response = _run_ok(workspace, "codex", "wait")
-    assert response["result"]["task_id"] == task_id  # type: ignore[index]
-    assert response["result"]["message"] == "采用方案 A，并记录取舍。"  # type: ignore[index]
+    assert response["data"]["result"]["task_id"] == task_id  # type: ignore[index]
+    assert response["data"]["result"]["message"] == "采用方案 A，并记录取舍。"  # type: ignore[index]
 
 
 def test_waiter_restart_redelivers_before_acknowledgement(
@@ -261,12 +261,12 @@ def test_waiter_restart_redelivers_before_acknowledgement(
     finally:
         _stop(restarted_wait)
 
-    task_id = sent["result"]["task_id"]  # type: ignore[index]
-    assert first["result"]["task_id"] == task_id  # type: ignore[index]
-    assert redelivered["result"]["task_id"] == task_id  # type: ignore[index]
+    task_id = sent["data"]["result"]["task_id"]  # type: ignore[index]
+    assert first["data"]["result"]["task_id"] == task_id  # type: ignore[index]
+    assert redelivered["data"]["result"]["task_id"] == task_id  # type: ignore[index]
     assert (
-        redelivered["result"]["message_id"]  # type: ignore[index]
-        == first["result"]["message_id"]  # type: ignore[index]
+        redelivered["data"]["result"]["message_id"]  # type: ignore[index]
+        == first["data"]["result"]["message_id"]  # type: ignore[index]
     )
 
 
@@ -295,12 +295,12 @@ def test_concurrent_sends_deliver_working_then_fifo_queued_task(
         sent = list(pool.map(send, (1, 2)))
 
     by_state = {
-        item["result"]["state"]: item["result"]  # type: ignore[index]
+        item["data"]["result"]["state"]: item["data"]["result"]  # type: ignore[index]
         for item in sent
     }
     assert set(by_state) == {"working", "queued"}
     first = _run_ok(workspace, "claude", "wait")
-    assert first["result"]["task_id"] == by_state["working"]["task_id"]  # type: ignore[index]
+    assert first["data"]["result"]["task_id"] == by_state["working"]["task_id"]  # type: ignore[index]
     _run_ok(
         workspace,
         "claude",
@@ -312,7 +312,7 @@ def test_concurrent_sends_deliver_working_then_fifo_queued_task(
         "先完成第一项",
     )
     second = _run_ok(workspace, "claude", "wait")
-    assert second["result"]["task_id"] == by_state["queued"]["task_id"]  # type: ignore[index]
+    assert second["data"]["result"]["task_id"] == by_state["queued"]["task_id"]  # type: ignore[index]
 
 
 def test_different_worktree_roots_use_isolated_rooms(tmp_path: Path) -> None:
@@ -351,9 +351,9 @@ def test_different_worktree_roots_use_isolated_rooms(tmp_path: Path) -> None:
     first_delivery = _run_ok(first, "claude", "wait")
     second_status = _run_ok(second, "claude", "status")
 
-    assert first_delivery["room"] == sent["room"]
-    assert second_status["room"] != sent["room"]
-    assert second_status["result"]["active_task"] is None  # type: ignore[index]
+    assert first_delivery["data"]["room"] == sent["data"]["room"]
+    assert second_status["data"]["room"] != sent["data"]["room"]
+    assert second_status["data"]["result"]["active_task"] is None  # type: ignore[index]
 
 
 def test_advisor_reply_is_blocked_after_source_change(tmp_path: Path) -> None:
@@ -387,7 +387,7 @@ def test_advisor_reply_is_blocked_after_source_change(tmp_path: Path) -> None:
         workspace,
         "claude",
         "reply",
-        str(sent["result"]["task_id"]),  # type: ignore[index]
+        str(sent["data"]["result"]["task_id"]),  # type: ignore[index]
         "--outcome",
         "done",
         "--message",
@@ -396,7 +396,7 @@ def test_advisor_reply_is_blocked_after_source_change(tmp_path: Path) -> None:
 
     assert blocked.returncode == 0
     assert blocked.stderr == ""
-    result = _parse_compact_json(blocked.stdout)["result"]  # type: ignore[index]
+    result = _parse_compact_json(blocked.stdout)["data"]["result"]  # type: ignore[index]
     assert result["state"] == "blocked"  # type: ignore[index]
     assert result["guard_violations"] == ["src/module.py"]  # type: ignore[index]
     assert source.read_text(encoding="utf-8") == "VALUE = 2\n"
@@ -451,7 +451,7 @@ def test_156k_codex_fixture_triggers_context_check(tmp_path: Path) -> None:
 
     assert stdout == ""
     assert stderr == ""
-    result = request["result"]
+    result = request["data"]["result"]
     assert result["kind"] == "context_check"  # type: ignore[index]
     assert result["context"] == {  # type: ignore[index]
         "input_tokens": 156_000,
@@ -519,7 +519,7 @@ def test_delivered_reply_does_not_starve_the_next_message(
         "--question",
         "第一个问题？",
     )
-    first_task = str(first["result"]["task_id"])  # type: ignore[index]
+    first_task = str(first["data"]["result"]["task_id"])  # type: ignore[index]
     request_wait = _start(workspace, "claude", "wait")
     try:
         _finish(request_wait)
@@ -536,7 +536,7 @@ def test_delivered_reply_does_not_starve_the_next_message(
         "第一个答复。",
     )
     reply = _run_ok(workspace, "codex", "wait")
-    assert reply["result"]["task_id"] == first_task  # type: ignore[index]
+    assert reply["data"]["result"]["task_id"] == first_task  # type: ignore[index]
 
     second = _run_ok(
         workspace,
@@ -549,8 +549,8 @@ def test_delivered_reply_does_not_starve_the_next_message(
         "--question",
         "第二个问题？",
     )
-    second_task = str(second["result"]["task_id"])  # type: ignore[index]
+    second_task = str(second["data"]["result"]["task_id"])  # type: ignore[index]
     time.sleep(LEASE_EXPIRY_SECONDS)
 
     delivered = _run_ok(workspace, "codex", "wait")
-    assert delivered["result"]["task_id"] == second_task  # type: ignore[index]
+    assert delivered["data"]["result"]["task_id"] == second_task  # type: ignore[index]

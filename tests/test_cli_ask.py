@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from ai_room.cli import EXIT_OPERATIONAL, EXIT_SUCCESS, main
+from ai_room.cli import EXIT_ARGUMENT, EXIT_FAILURE, EXIT_SUCCESS, main
 from ai_room.drivers.process import DriverTimeout
 from ai_room.drivers.protocol import Driver, DriverResult
 
@@ -111,6 +111,14 @@ def _run_ask(monkeypatch, *, driver, extra: list[str] | None = None):
     return code, (json.loads(raw) if raw else {}), err.getvalue()
 
 
+def _error_envelope(err: str) -> dict[str, object]:
+    """Parse the failure envelope that a failed dispatch writes to stderr."""
+    value = json.loads(err)
+    assert value["ok"] is False
+    assert value["data"] is None
+    return value["error"]
+
+
 def _run_resume(monkeypatch, *, driver, extra: list[str] | None = None):
     """Run ``ai-room resume`` against a fake driver and return (code, json, err)."""
     from ai_room import cli as cli_module
@@ -137,29 +145,34 @@ def test_ask_success_exits_zero_and_writes_ledger(
     code, payload, _ = _run_ask(monkeypatch, driver=_FakeDriver(_ok_result("sess-1")))
     assert code == EXIT_SUCCESS
     assert payload["ok"] is True
-    assert payload["result"]["session_id"] == "sess-1"
+    assert payload["data"]["result"]["session_id"] == "sess-1"
     ledger = _ledger(tmp_path)
     assert "sess-1" in ledger
     assert "`ok`" in ledger
 
 
-def test_ask_failure_exits_operational(tmp_path: Path, monkeypatch) -> None:
+def test_ask_failure_exits_failure(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     result = DriverResult(
         agent="claude", session_id=None, text="", exit_code=1, stderr="boom"
     )
-    code, payload, _ = _run_ask(monkeypatch, driver=_FakeDriver(result))
-    assert code == EXIT_OPERATIONAL
-    assert payload["ok"] is False
+    code, payload, err = _run_ask(monkeypatch, driver=_FakeDriver(result))
+    assert code == EXIT_FAILURE
+    assert payload == {}
+    error = _error_envelope(err)
+    assert error["code"] == "E_EXTERNAL_TOOL"
+    assert error["details"]["status"] == "error"
+    assert error["details"]["exit_code"] == 1
     assert "`error`" in _ledger(tmp_path)
 
 
 def test_ask_timeout_writes_error_ledger(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     driver = _RaisingDriver(DriverTimeout("claude sub-agent timed out after 1s"))
-    code, payload, _ = _run_ask(monkeypatch, driver=driver)
-    assert code == EXIT_OPERATIONAL
-    assert payload["result"]["status"] == "timeout"
+    code, _, err = _run_ask(monkeypatch, driver=driver)
+    assert code == EXIT_FAILURE
+    error = _error_envelope(err)
+    assert error["details"]["status"] == "timeout"
     assert "`timeout`" in _ledger(tmp_path)
 
 
@@ -170,22 +183,24 @@ def test_ask_timeout_hands_back_a_way_to_continue(
 
     Reporting only "timed out" leaves re-dispatching the same task as the only
     available move, which bills the whole turn a second time -- so the handle,
-    the partial answer and the resume command all travel on the result.
+    the partial answer and the resume command all travel on the error envelope.
     """
     monkeypatch.chdir(tmp_path)
     partial = '{"type":"result","session_id":"sess-cut","result":"half done"}'
     driver = _RaisingDriver(
         DriverTimeout("timed out", stdout=partial, reason="idle")
     )
-    code, payload, _ = _run_ask(monkeypatch, driver=driver)
-    result = payload["result"]
-    assert code == EXIT_OPERATIONAL
-    assert result["ok"] is False
-    assert result["timeout_reason"] == "idle"
-    assert result["session_id"] == "sess-cut"
-    assert "ai-room resume" in result["resume_command"]
-    assert "sess-cut" in result["resume_command"]
-    assert "do not re-send" in result["hint"]
+    code, payload, err = _run_ask(monkeypatch, driver=driver)
+    assert payload == {}
+    assert code == EXIT_FAILURE
+    error = _error_envelope(err)
+    details = error["details"]
+    assert details["timeout_reason"] == "idle"
+    assert details["session_id"] == "sess-cut"
+    assert "ai-room resume" in details["resume_command"]
+    assert "sess-cut" in details["resume_command"]
+    assert "do not re-send" in details["hint"]
+    assert error["suggestion"] == details["resume_command"]
 
 
 def test_ask_timeout_recovers_the_session_id_from_partial_output(
@@ -200,7 +215,7 @@ def test_ask_timeout_recovers_the_session_id_from_partial_output(
     partial = '{"type":"thread.started","thread_id":"thr-abc"}\n{"type":"item.st'
     driver = _RaisingDriver(DriverTimeout("timed out", stdout=partial))
     code, _, _ = _run_ask(monkeypatch, driver=driver)
-    assert code == EXIT_OPERATIONAL
+    assert code == EXIT_FAILURE
     ledger = _ledger(tmp_path)
     assert "thr-abc" in ledger
     assert "`timeout`" in ledger
@@ -222,7 +237,7 @@ def test_ask_timeout_falls_back_to_the_preassigned_id(
     monkeypatch.chdir(tmp_path)
     driver = _RaisingDriver(DriverTimeout("timed out", stdout=""))
     code, _, _ = _run_ask(monkeypatch, driver=driver)
-    assert code == EXIT_OPERATIONAL
+    assert code == EXIT_FAILURE
     ledger = _ledger(tmp_path)
     assert "无会话 id" not in ledger
     assert "claude -r " in ledger
@@ -237,7 +252,7 @@ def test_ask_does_not_invent_an_id_when_the_cli_never_ran(
     monkeypatch.chdir(tmp_path)
     driver = _RaisingDriver(DriverError("claude CLI not found on PATH"))
     code, _, _ = _run_ask(monkeypatch, driver=driver)
-    assert code == EXIT_OPERATIONAL
+    assert code == EXIT_FAILURE
     assert "unknown" in _ledger(tmp_path)
 
 
@@ -257,7 +272,9 @@ def test_ask_reports_changed_files_without_failing_the_dispatch(
 
     assert code == EXIT_SUCCESS
     assert payload["ok"] is True
-    assert any("secret.txt" in line for line in payload["result"]["changed_files"])
+    assert any(
+        "secret.txt" in line for line in payload["data"]["result"]["changed_files"]
+    )
     ledger = _ledger(tmp_path)
     assert "`ok`" in ledger
     assert "secret.txt" in ledger
@@ -275,7 +292,7 @@ def test_ask_receipt_ignores_changes_that_predate_the_dispatch(
     code, payload, _ = _run_ask(monkeypatch, driver=_FakeDriver(_ok_result()))
 
     assert code == EXIT_SUCCESS
-    assert payload["result"]["changed_files"] == []
+    assert payload["data"]["result"]["changed_files"] == []
 
 
 def test_ask_outside_a_git_repo_reports_no_receipt_and_still_succeeds(
@@ -286,7 +303,7 @@ def test_ask_outside_a_git_repo_reports_no_receipt_and_still_succeeds(
     driver = _WritingDriver(_ok_result(), tmp_path / "made.txt", "x")
     code, payload, _ = _run_ask(monkeypatch, driver=driver)
     assert code == EXIT_SUCCESS
-    assert payload["result"]["changed_files"] == []
+    assert payload["data"]["result"]["changed_files"] == []
 
 
 def test_ask_defaults_to_read_only(tmp_path: Path, monkeypatch) -> None:
@@ -444,7 +461,7 @@ def test_resume_continues_the_killed_dispatch_without_being_told_which(
     code, payload, _ = _run_resume(monkeypatch, driver=driver)
     assert code == EXIT_SUCCESS
     assert driver.request.resume_session == "sess-orphan"
-    assert payload["result"]["resumed_from"] == "sess-orphan"
+    assert payload["data"]["result"]["resumed_from"] == "sess-orphan"
 
 
 def test_resume_tells_the_sub_agent_to_carry_on_not_to_restart(
@@ -473,12 +490,12 @@ def test_resume_refuses_a_bare_handle_without_its_vendor(
     code, _, err = _run_resume(
         monkeypatch, driver=_FakeDriver(_ok_result()), extra=["--session", "sess-1"]
     )
-    assert code == EXIT_OPERATIONAL
+    assert code == EXIT_ARGUMENT
     assert "resume_agent_required" in err
 
 
 def test_resume_with_nothing_to_resume_says_so(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     code, _, err = _run_resume(monkeypatch, driver=_FakeDriver(_ok_result()))
-    assert code == EXIT_OPERATIONAL
+    assert code == EXIT_FAILURE
     assert "no_inflight_run" in err

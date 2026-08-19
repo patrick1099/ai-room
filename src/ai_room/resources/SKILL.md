@@ -5,7 +5,7 @@ description: 用本机 ai-room CLI 调动另一个 AI，默认走 `ask` 无头�
 
 # ai-room
 
-本机 CLI，命令名 `ai-room`（等价 `python -m ai_room`）。每条命令输出**一行 JSON**，成功是 `{"ok":true,...}`。退出码：`0` 成功、`2` 参数错、`3` 运行或业务失败、`130` 被中断。
+本机 CLI，命令名 `ai-room`（等价 `python -m ai_room`）。每条命令输出**一行 JSON 信封**（machine_only：默认恒为 JSON），成功是 `{"ok":true,"data":{...},"error":null,"meta":{}}`，业务字段在 `data` 里（如 `data.result`）；失败信封走 **stderr**，`{"ok":false,"data":null,"error":{"code":"E_*","message":"...","details":{...},"retryable":false,"suggestion":"..."},"meta":{}}`。退出码：`0` 成功、`1` 运行/业务失败（含中断 `E_INTERRUPTED`）、`2` 参数/用法错误（`E_VALIDATION`）。错误码遵循 CLI-AI 规范总表（`E_VALIDATION`/`E_NOT_FOUND`/`E_IO`/`E_PLATFORM`/`E_EXTERNAL_TOOL`/`E_INTERRUPTED`/`E_INTERNAL`）。
 
 ## 三个角色，谁也不许串岗
 
@@ -117,21 +117,21 @@ ai-room ask --to claude|codex|opencode --question TEXT
 - **绝不要为了"躲开 shell 超时"去压小 `--timeout`。** 压小的是沉默预算，只会把**正在思考的**子 agent 误杀，而那一轮照样按整轮计费——这正是最初把钱烧掉的那个动作。要让长任务跑得完，调大的是外层 shell 的 timeout。
 - ai-room 的硬顶被有意设得比外层闸小，好让**它先响**：ai-room 判的超时带完整回执（下一节），被外层掐则什么都拿不到。
 - **`ask` 是同步阻塞的**，返回时子 agent 已经跑完。一个咨询几十秒，一个真任务几分钟。它**不会** detach。
-- 退出码 0 表示厂商自己判定这一轮成功；失败和超时退 3。`changed_files` 是**回执**，只供复核，不影响退出码——派活时本来就不知道它该动哪些文件，没有可越的界。
+- 退出码 0 表示厂商自己判定这一轮成功；失败和超时退 1，失败信封走 stderr、`error.code=E_EXTERNAL_TOOL`，`error.details` 含完整回执（agent/status/session_id/exit_code/text/changed_files/resume_command），`error.suggestion` 是可续接的 `ai-room resume ...`。`changed_files` 是**回执**，只供复核，不影响退出码——派活时本来就不知道它该动哪些文件，没有可越的界。
 - 台账写在 `<工作树根>/.ai-room/ledger.md`，含子 agent 的 **session id** 供续接，并自动生成 `.ai-room/.gitignore`（内容 `*`）避免进仓库。`--no-ledger` 关闭。
 
 ## 超时了怎么办：**续接，绝不重发**
 
 超时不等于这一轮没发生。**厂商已经按整轮计费了**，子 agent 多半已经想完、甚至说了一半。此时重发同一条 `ask`，是让它从零把同一件事再做一遍，**同一份钱付两次**，而且第二遍照样会超时。
 
-所以超时**不是报错，是一个带把手的结果**：`ok:false` + `status:"timeout"`，同时给你
+所以超时**不是报错，是一个带把手的结果**：退出码 1，stderr 信封 `error.code=E_EXTERNAL_TOOL`、`error.details.status:"timeout"`，同时给你
 
 | 字段 | 是什么 |
 |---|---|
 | `timeout_reason` | `idle`（真沉默了）或 `max-runtime`（一直在说但不收敛） |
 | `session_id` | 这一轮的会话 id，从它已经吐出来的输出里抢救 |
 | `text` | 超时前已经说出来的那部分回答——经常已经够用 |
-| `resume_command` | 可直接跑的 `ai-room resume ...`，**默认动作就是它** |
+| `resume_command` | 可直接跑的 `ai-room resume ...`，**默认动作就是它**（也在 `error.suggestion`） |
 | `vendor_resume_command` | 厂商原生续接命令，ai-room 不可用时的兜底 |
 
 ```text

@@ -33,7 +33,7 @@
 
 超时那一轮**已经计过费了**。重发同一条 `ask` 是让子 agent 从零重做，同一份钱付两次。
 
-- ai-room 自己判超时时，回执带 `session_id`、已产出的 `text` 和 `resume_command`——先看 `text`（常常已经够用），不够就跑 `resume_command`。
+- ai-room 自己判超时时，失败信封 `error.details` 带 `session_id`、已产出的 `text` 和 `resume_command`（`error.suggestion` 同值）——先看 `details.text`（常常已经够用），不够就跑 `resume_command`。
 - **你这道 10 秒的闸尤其容易先掐**，那种情况连回执都没有。直接跑 `ai-room resume --cwd <项目根>`：session id 在子 agent 一开口时就落盘到 `.ai-room/inflight/`，进程被杀也还在。
 - 完整规则见 `SKILL.md` 的「超时了怎么办」。
 
@@ -58,7 +58,7 @@ ai-room ask --to opencode --permission workspace-write --cwd /path/to/project \
 
 **机械活根本不用走这一步。opencode 是廉价劳力，随便用。** 批量改名/替换、跑格式化、加日志、照现成模式补样板代码、跑测试构建并摘出失败、写死板的单测骨架、大范围 grep 汇总、改错别字补注释补类型标注——这类活没有方案可审，直接派，别自己埋头做。判定只有一句：**这件事有没有技术取舍？** 没有就直接派。
 
-拿回结果看 `ok`、`status`（`ok` / `error` / `timeout`）、`text`（**超时时也有**，是它已经说出来的那部分）、`changed_files`（回执，不是沙箱）、`session_id` / `resume_command` / `ledger`。**opencode 的产出你必须自己复核**，它是执行者不是负责人。
+成功时 stdout 信封 `data.result` 里看：`ok`、`status`（`ok`）、`text`、`changed_files`（回执，不是沙箱）、`session_id` / `resume_command` / `ledger`。失败或超时走 stderr 失败信封 `error.code=E_EXTERNAL_TOOL`，完整回执在 `error.details`，`error.suggestion` 是可续接的 `ai-room resume ...`。**opencode 的产出你必须自己复核**，它是执行者不是负责人。
 
 `ask` 不会 detach。要边等边干活就自己起一个子 agent 去做那次阻塞调用；但代理开销起步两三分钟，咨询同步做，只有真任务才值得代理。
 

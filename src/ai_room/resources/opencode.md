@@ -32,9 +32,9 @@
 
 | 你跑 | 会得到 |
 |---|---|
-| `ai-room join opencode` | `argument_error: argument agent: invalid choice: 'opencode' (choose from 'codex', 'claude')`，退出码 **2** |
-| `ai-room join claude` / `join codex` | 同样失败——它先探测当前会话，探不到就报 `session_detection_failed`。**不要冒充别人的身份** |
-| `ai-room wait` / `send` / `reply` / `status` / `leave` | `session_detection_failed: no current AI session detected; expected CODEX_THREAD_ID or the Claude SessionStart environment values`，退出码 **3** |
+| `ai-room join opencode` | `E_VALIDATION` 信封（`argument agent: invalid choice: 'opencode'`），退出码 **2** |
+| `ai-room join claude` / `join codex` | 同样失败——它先探测当前会话，探不到就报 `session_detection_failed`（`E_PLATFORM`）。**不要冒充别人的身份** |
+| `ai-room wait` / `send` / `reply` / `status` / `leave` | `session_detection_failed`（`E_PLATFORM` 信封），退出码 **1** |
 | `ai-room ask ...` | **能跑。** ask 是唯一对"无身份调用者"做了兜底的命令（台账里 `sender` 记成 `null`） |
 
 `ask` 也正好是默认路径。要咨询决策者时直接跑，**不要反问用户要不要开第二个窗口**——那个模式你根本参加不了。
@@ -61,9 +61,9 @@
 
 超时那一轮**已经计过费了**，重发同一条 `ask` 是同一份钱付两次，而且第二遍照样会超时。
 
-- **ai-room 判的超时**：回执带 `status:"timeout"`、`timeout_reason`、`session_id`、已产出的 `text`、`resume_command`。**先看 `text`**——它经常已经把话说完了，那就直接用，连 resume 都不用跑；不够再跑 `resume_command`。
+- **ai-room 判的超时**：stderr 失败信封 `error.code=E_EXTERNAL_TOOL`、`error.details` 带 `status:"timeout"`、`timeout_reason`、`session_id`、已产出的 `text`、`resume_command`（`error.suggestion` 同值）。**先看 `details.text`**——它经常已经把话说完了，那就直接用，连 resume 都不用跑；不够再跑 `resume_command`。
 - **被你自己的 shell 掐掉**：什么回执都没有。直接跑 `ai-room resume --cwd <项目根>`——session id 在子 agent 一开口时就落盘到 `.ai-room/inflight/`，ai-room 进程被杀也还在。
-- 只有一种情况该重发：回执里连 `session_id` 都没有（`resume_command` 是 `null`），说明它还没开口就被打死，没有东西可续。
+- 只有一种情况该重发：信封里连 `session_id` 都没有（`resume_command` 是 `null`），说明它还没开口就被打死，没有东西可续。
 - 完整规则见 `SKILL.md` 的「超时了怎么办」。
 
 ## 咨询决策者的写法
@@ -81,7 +81,9 @@ ai-room ask --to claude --cwd /path/to/project \
 
 ## 读结果
 
-返回的一行 JSON 里看：`ok`（厂商自己的成败判定）、`status`（`ok` / `error` / `timeout`）、`text`（回答，**超时时也有**，是它已经说出来的那部分）、`changed_files`（回执，**不是沙箱**，见 `SKILL.md` 铁律 4）、`session_id` / `resume_command` / `ledger`（续接用）。
+成功：stdout 一行信封，业务字段在 `data`——`data.ok`（厂商自己的成败判定）、`data.result` 里是 `status`（`ok`）、`text`（回答）、`changed_files`（回执，**不是沙箱**，见 `SKILL.md` 铁律 4）、`session_id` / `resume_command` / `ledger`（续接用）。
+
+失败或超时：stderr 失败信封，`error.code=E_EXTERNAL_TOOL`，完整回执在 `error.details`（含 `text`、`session_id`、`resume_command`），`error.suggestion` 是可续接的 `ai-room resume ...`。
 
 各目标的档位映射见 `SKILL.md` 的「三个目标的差异」。你自己这一格要记住一条：opencode **没有第三档**，`full-access` 和 `workspace-write` 完全一样（都是 `--auto`），`read-only` 是 `--agent plan`。
 
