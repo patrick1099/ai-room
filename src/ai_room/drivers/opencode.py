@@ -19,6 +19,8 @@ from .protocol import (
 
 class OpenCodeDriver(Driver):
     name = "opencode"
+    # --variant names are defined per provider, so they cannot be checked here.
+    efforts = None
     _BINARY_CANDIDATES = ("opencode", "opencode.cmd", "opencode.ps1")
 
     def invoke(self, request: DriverRequest) -> DriverResult:
@@ -40,6 +42,8 @@ class OpenCodeDriver(Driver):
             command += ["--auto"]
         if request.model:
             command += ["--model", request.model]
+        if request.effort:
+            command += ["--variant", request.effort]
         if request.resume_session:
             command += ["--session", request.resume_session]
         command.append(compose_prompt(request))

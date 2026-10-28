@@ -499,3 +499,174 @@ def test_resume_with_nothing_to_resume_says_so(tmp_path: Path, monkeypatch) -> N
     code, _, err = _run_resume(monkeypatch, driver=_FakeDriver(_ok_result()))
     assert code == EXIT_FAILURE
     assert "no_inflight_run" in err
+
+
+# --- model and effort ---
+
+
+class _TieredDriver(_FakeDriver):
+    efforts = ("low", "high", "max")
+
+
+@pytest.fixture(autouse=True)
+def _defaults_file(tmp_path: Path, monkeypatch) -> Path:
+    """Point models.toml at a test copy so no test depends on real model names."""
+    from ai_room import model_defaults
+
+    path = tmp_path / "models-under-test.toml"
+    path.write_text("", encoding="utf-8")
+    monkeypatch.setattr(model_defaults, "defaults_file", lambda: path)
+    return path
+
+
+@pytest.fixture
+def tiered(_defaults_file: Path) -> Path:
+    _defaults_file.write_text(
+        '[claude]\nmodel = "strong"\neffort = "max"\n', encoding="utf-8"
+    )
+    return _defaults_file
+
+
+def test_ask_with_a_broken_defaults_file_refuses_to_dispatch(
+    tmp_path: Path, monkeypatch, _defaults_file: Path
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    _defaults_file.write_text("[claude\n", encoding="utf-8")
+    driver = _TieredDriver(_ok_result())
+    code, _, err = _run_ask(monkeypatch, driver=driver)
+    assert code == EXIT_FAILURE
+    assert "model_defaults_invalid" in err
+    assert driver.request is None
+
+
+def test_ask_defaults_come_from_the_defaults_file(
+    tmp_path: Path, monkeypatch, tiered
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    driver = _TieredDriver(_ok_result())
+    code, payload, _ = _run_ask(monkeypatch, driver=driver)
+    assert code == EXIT_SUCCESS
+    assert (driver.request.model, driver.request.effort) == ("strong", "max")
+    result = payload["data"]["result"]
+    assert (result["model"], result["effort"]) == ("strong", "max")
+    assert "思考档位: max" in _ledger(tmp_path)
+
+
+def test_ask_explicit_model_and_effort_win(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    driver = _TieredDriver(_ok_result())
+    _run_ask(
+        monkeypatch, driver=driver, extra=["--model", "cheap", "--effort", "low"]
+    )
+    assert (driver.request.model, driver.request.effort) == ("cheap", "low")
+
+
+def test_ask_rejects_an_effort_the_vendor_does_not_have(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    driver = _TieredDriver(_ok_result())
+    code, _, err = _run_ask(monkeypatch, driver=driver, extra=["--effort", "ultra"])
+    assert code == EXIT_ARGUMENT
+    assert "E_VALIDATION" in err
+    assert driver.request is None
+
+
+def test_ask_rejects_effort_for_a_driver_without_one(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    driver = _FakeDriver(_ok_result())
+    code, _, _ = _run_ask(monkeypatch, driver=driver, extra=["--effort", "max"])
+    assert code == EXIT_ARGUMENT
+
+
+def test_resume_inherits_the_sessions_model_and_effort(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A resumed turn is the same conversation; it must not change tier."""
+    monkeypatch.chdir(tmp_path)
+    first = _TieredDriver(_ok_result("sess-tier"))
+    _run_ask(
+        monkeypatch, driver=first, extra=["--model", "mid", "--effort", "high"]
+    )
+    second = _TieredDriver(_ok_result("sess-tier"))
+    code, payload, _ = _run_resume(
+        monkeypatch,
+        driver=second,
+        extra=["--to", "claude", "--session", "sess-tier"],
+    )
+    assert code == EXIT_SUCCESS
+    assert (second.request.model, second.request.effort) == ("mid", "high")
+    assert payload["data"]["result"]["effort"] == "high"
+
+
+def test_resume_of_a_killed_run_inherits_its_tier(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The settings are on disk from the moment the handle is announced."""
+    monkeypatch.chdir(tmp_path)
+    from ai_room.session_settings import SessionSettings, record_settings
+
+    _orphan(tmp_path, session_id="sess-killed")
+    record_settings(
+        tmp_path,
+        agent="claude",
+        session_id="sess-killed",
+        settings=SessionSettings(model="mid", effort="low"),
+    )
+    driver = _TieredDriver(_ok_result("sess-killed"))
+    _run_resume(monkeypatch, driver=driver)
+    assert (driver.request.model, driver.request.effort) == ("mid", "low")
+
+
+def test_resume_inherits_a_vendor_default_as_a_vendor_default(
+    tmp_path: Path, monkeypatch, tiered
+) -> None:
+    """A session started on the vendor default must not be bumped on resume."""
+    monkeypatch.chdir(tmp_path)
+    from ai_room.session_settings import SessionSettings, record_settings
+
+    record_settings(
+        tmp_path,
+        agent="claude",
+        session_id="sess-plain",
+        settings=SessionSettings(model=None, effort=None),
+    )
+    driver = _TieredDriver(_ok_result("sess-plain"))
+    _run_resume(
+        monkeypatch, driver=driver, extra=["--to", "claude", "--session", "sess-plain"]
+    )
+    assert (driver.request.model, driver.request.effort) == (None, None)
+
+
+def test_resume_explicit_flag_still_overrides_the_inherited_one(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    from ai_room.session_settings import SessionSettings, record_settings
+
+    record_settings(
+        tmp_path,
+        agent="claude",
+        session_id="sess-o",
+        settings=SessionSettings(model="mid", effort="high"),
+    )
+    driver = _TieredDriver(_ok_result("sess-o"))
+    _run_resume(
+        monkeypatch,
+        driver=driver,
+        extra=["--to", "claude", "--session", "sess-o", "--effort", "max"],
+    )
+    assert (driver.request.model, driver.request.effort) == ("mid", "max")
+
+
+def test_resume_of_an_unrecorded_session_falls_back_to_defaults(
+    tmp_path: Path, monkeypatch, tiered
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    driver = _TieredDriver(_ok_result("sess-old"))
+    _run_resume(
+        monkeypatch, driver=driver, extra=["--to", "claude", "--session", "sess-old"]
+    )
+    assert (driver.request.model, driver.request.effort) == ("strong", "max")

@@ -3,7 +3,7 @@
 让正在干活的那个 AI 自己把活派出去，或者把方案交给另一个 AI 审一遍，不用你开第二个窗口、
 也不用你在两边复制粘贴上下文。
 
-Claude Code / Codex / opencode 三方互通，本机运行，Windows 优先，Python 3.11+。
+Claude Code / Codex / opencode / dsh 四方互通，本机运行，Windows 优先，Python 3.11+。
 
 ## 先看它干什么
 
@@ -14,7 +14,7 @@ Claude Code / Codex / opencode 三方互通，本机运行，Windows 优先，Py
 ai-room ask --to codex --related-doc src/protocol/parser.c `
   --question "项目是<X>,要解决<Y>。我的方案是<方案>,不确定的是<疑点>。请判断是否成立、哪里必须改。"
 
-# ② 派 opencode 执行：交上去的是一件拆好的任务,可写
+# ② 派 opencode / dsh 执行：交上去的是一件拆好的任务,可写
 ai-room ask --to opencode --permission workspace-write --related-doc src/protocol/parser.c `
   --question "方案已定为<定稿>(已过评审)。这一件任务:给 parse_frame 补边界单测并跑通。完成标准:<可验证标准>。"
 ```
@@ -50,13 +50,13 @@ skill 目录和一个 Claude `SessionStart` hook，细节与回滚见
 |---|---|---|
 | 主聊 | 此刻正在服务用户的那一个 | 出方案、拆任务、收口 |
 | 决策者 | 对面那个 peer：claude ↔ codex | 审方案、指出哪里要改、拍技术取舍。保持 `read-only`，不动手 |
-| 执行者 | 只有 opencode | 接一件拆好的任务去做。不问它决策，不让它定方案 |
+| 执行者 | opencode / dsh（默认 opencode；dsh 需用户明确允许） | 接一件拆好的任务去做。不问它决策，不让它定方案 |
 
-给决策者写权限就是角色串岗，所以 `--permission` 默认 `read-only`，只有派 opencode 干活才
-用 `workspace-write`。派给 opencode 的是有手的工人，顾问那套「只改指定文档、不跑测试构建」
+给决策者写权限就是角色串岗，所以 `--permission` 默认 `read-only`，只有派 opencode / dsh 干活才
+用 `workspace-write`。默认派 opencode；dsh 只有在用户明确允许时才能调用。派给 opencode / dsh 的是有手的工人，顾问那套「只改指定文档、不跑测试构建」
 的约束在这条路上不成立。
 
-**opencode 是廉价劳力，机械活随便派**：批量改名、跑格式化、加日志、补样板代码、跑测试并摘出
+**opencode / dsh 是廉价劳力，机械活随便派；默认 opencode，dsh 需用户明确允许**：批量改名、跑格式化、加日志、补样板代码、跑测试并摘出
 失败、改错别字。这类活没有方案可审，直接派。
 
 有技术取舍时才走「先咨询，后执行」，而且门槛是方案级的一次，不是每件任务都重审。判定只有
@@ -96,13 +96,15 @@ ai-room resume --to opencode --session ses_xxx --permission workspace-write --cw
 | `join` / `wait` / `send` / `reply` / `leave` | 双窗口信箱模式，见下 |
 
 `--cwd` 决定针对哪个项目派发，并用各厂商的原生参数钉死（claude `--add-dir`、codex `-C`、
-opencode `--dir`），不靠进程 cwd。opencode 尤其必须给：它完全无视进程 cwd，不给就会跑去改
+opencode `--dir`、dsh `--cwd`），不靠进程 cwd。opencode 尤其必须给：它完全无视进程 cwd，不给就会跑去改
 它自己记着的上一个项目，且照样 exit 0。
 
 退出码 0 表示厂商自己说这一轮成功，失败和超时退 3。子 agent 改了哪些文件作为回执返回，只供
 复核，不影响退出码。回执有两条硬限制，别把它当沙箱：**看不到 gitignore 里的东西**（回执是
 `git status --porcelain` 的差集），**救不了跑错目录**（子 agent 整个跑在别的项目里时，这里
 一片干净）。边界只能靠工作目录参数钉死。
+
+信箱模式命令为 `ai-room join` / `ai-room wait` / `ai-room send` / `ai-room reply` / `ai-room status` / `ai-room leave`。
 
 ## 双窗口信箱模式
 
@@ -120,10 +122,16 @@ ai-room join claude  ;  ai-room wait
 反向发送。每个会话必须用自己的身份加入。
 
 顾问只负责技术决策和需求、设计、计划文档的审查或修改，可以按需只读源码，但不能修改源码，
-也不能替主聊 AI 运行测试、构建、部署。`--writable-doc` 是顾问唯一可修改的精确文件，且只有
+也不能替主聊 AI 运行测试、构建、部署。 任何超出 `--writable-doc` 的写操作都必须另行获得用户明确批准。`--writable-doc` 是顾问唯一可修改的精确文件，且只有
 `requirements-review` / `design-review` / `plan-review` 三类允许携带它。
 
 这条路当前状态是 **awaiting dual-window acceptance**，真实双窗口验收尚未执行。
+
+## 运行数据
+
+房间库在 `%LOCALAPPDATA%/ai-room`，不进项目仓库。`wait` 被中断、进程结束或重启时，未确认消息会在租约到期后重新投递；`leave` 和卸载都**不会删除**历史。
+
+自动验证通过不等于真实可用；manual acceptance 需要用户在一个真实 Codex 窗口和一个真实 Claude Code 窗口完成全部未勾选清单后，设计状态才可以改为 `accepted`。
 
 ## 其余文档
 
@@ -131,6 +139,7 @@ ai-room join claude  ;  ai-room wait
 - [安装集成、备份与卸载](docs/install-and-rollback.md)
 - [需求清单](docs/NEEDS.md) · [设计文档](docs/superpowers/specs/2026-07-23-ai-room-design.md)
 - [真实双窗口验收清单](docs/acceptance/dual-window.md)
+- [与 ACP / A2A 的关系](docs/acp-a2a-positioning.md)
 
 自动验证通过不等于真实可用。只有用户在一个真实 Codex 窗口和一个真实 Claude Code 窗口完成
 全部未勾选清单后，设计状态才可以改为 `accepted`。

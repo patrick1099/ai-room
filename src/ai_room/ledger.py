@@ -46,6 +46,7 @@ class LedgerEntry:
     total_cost_usd: float | None = None
     num_turns: int | None = None
     usage: dict | None = None
+    effort: str | None = None
 
 
 def append_ledger(root: Path, entry: LedgerEntry) -> Path:
@@ -112,6 +113,7 @@ def _format_entry(entry: LedgerEntry) -> str:
         f"- \u72b6\u6001: {entry.status} (exit {entry.exit_code})",
         f"- \u53d1\u8d77\u8005: {entry.sender or '(unknown)'}",
         f"- \u6a21\u578b: {entry.model or '(default)'}",
+        f"- \u601d\u8003\u6863\u4f4d: {entry.effort or '(default)'}",
         f"- \u95ee\u9898: {_single_line(entry.question)}",
         f"- \u76f8\u5173\u6587\u6863: {docs}",
         f"- \u5b50 agent session id: `{entry.session_id or 'unknown'}`",
@@ -155,4 +157,6 @@ def resume_hint(agent: str, session_id: str | None) -> str | None:
         return f"codex exec resume {session_id}"
     if agent == "opencode":
         return f"opencode run --session {session_id}"
+    if agent == "dsh":
+        return f"dsh --profile dsh-agent --session {session_id}"
     return session_id

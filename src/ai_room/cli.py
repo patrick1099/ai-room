@@ -52,6 +52,8 @@ from .ledger import LedgerEntry, append_ledger, resume_hint
 from .paths import normalize_root, resolve_room, runtime_root
 from .receipt import changed_since, status_lines
 from .service import AiRoomService
+from .model_defaults import ModelDefaultsError, defaults_for
+from .session_settings import SessionSettings, lookup_settings, record_settings
 from .storage import (
     DatabaseBusyError,
     DatabaseOpenError,
@@ -208,7 +210,7 @@ def build_parser() -> argparse.ArgumentParser:
     ask.add_argument(
         "--to",
         required=True,
-        choices=("claude", "codex", "opencode"),
+        choices=("claude", "codex", "opencode", "dsh"),
     )
     ask.add_argument("--question", required=True)
     _add_dispatch_arguments(ask)
@@ -220,7 +222,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_output_flags(resume)
     resume.add_argument(
         "--to",
-        choices=("claude", "codex", "opencode"),
+        choices=("claude", "codex", "opencode", "dsh"),
         help="which vendor holds the session; required with --session",
     )
     resume.add_argument(
@@ -259,7 +261,23 @@ def _add_dispatch_arguments(command: argparse.ArgumentParser) -> None:
             "directory), or full-access (no sandbox)"
         ),
     )
-    command.add_argument("--model", metavar="MODEL")
+    command.add_argument(
+        "--model",
+        metavar="MODEL",
+        help=(
+            "model for the sub-agent; defaults to the strongest tier for "
+            "claude/codex, and on resume to what the session last ran with"
+        ),
+    )
+    command.add_argument(
+        "--effort",
+        metavar="LEVEL",
+        help=(
+            "reasoning effort: low|medium|high|xhigh|max (codex also ultra; "
+            "opencode takes its provider's --variant names). Defaults to max "
+            "for claude/codex, and on resume to what the session last ran with"
+        ),
+    )
     command.add_argument("--cwd", metavar="DIR", help="which project to dispatch against; the sub-agent runs in the room root selected by this path")
     command.add_argument(
         "--timeout",
@@ -687,6 +705,8 @@ def main(
             code, rc = "E_VALIDATION", EXIT_FAILURE
         elif error.code == "resume_agent_required":
             code, rc = "E_VALIDATION", EXIT_ARGUMENT
+        elif error.code == "model_defaults_invalid":
+            code, rc = "E_VALIDATION", EXIT_FAILURE
         else:
             code, rc = "E_INTERNAL", EXIT_FAILURE
         _write_error(errors, code, str(error), details={"reason": error.code})
@@ -976,7 +996,7 @@ def _resume_target(
         if not arguments.to:
             raise CliOperationalError(
                 "resume_agent_required",
-                "--session needs --to claude|codex|opencode: a handle does not "
+                "--session needs --to claude|codex|opencode|dsh: a handle does not "
                 "say which vendor issued it.",
             )
         return arguments.to, arguments.session, question
@@ -994,6 +1014,47 @@ def _resume_target(
     return run.agent, run.session_id, question
 
 
+def _resolve_settings(
+    arguments: argparse.Namespace,
+    root: Path,
+    driver,
+    target: str,
+    resume_session: str | None,
+) -> SessionSettings:
+    """Pick the model and effort: explicit flag, then the resumed session's own,
+    then the per-agent default in ``resources/models.toml``.
+
+    A resume inherits as a pair and inherits exactly, including "vendor
+    default": continuing a conversation on a different model or at a different
+    effort than it was started with is a silent downgrade (or upgrade) the
+    caller never asked for.  Only a session with no record at all -- started
+    before settings were kept, or under --no-ledger -- falls back to defaults.
+    """
+    recorded = (
+        lookup_settings(root, agent=target, session_id=resume_session)
+        if resume_session
+        else None
+    )
+    if recorded is not None:
+        fallback = recorded
+    else:
+        try:
+            fallback = defaults_for(target)
+        except ModelDefaultsError as error:
+            raise CliOperationalError("model_defaults_invalid", str(error)) from error
+    model = arguments.model or fallback.model
+    effort = arguments.effort or fallback.effort
+    if effort is not None and driver.efforts is not None:
+        if not driver.efforts:
+            raise CliArgumentError(f"{target} has no reasoning-effort setting.")
+        if effort not in driver.efforts:
+            raise CliArgumentError(
+                f"{target} does not accept --effort {effort!r}; "
+                f"expected one of {', '.join(driver.efforts)}."
+            )
+    return SessionSettings(model=model, effort=effort)
+
+
 def _dispatch(
     arguments: argparse.Namespace,
     root: Path,
@@ -1009,13 +1070,22 @@ def _dispatch(
         root,
         (Path(value) for value in arguments.related_doc),
     )
+    driver = driver_for(target)
+    settings = _resolve_settings(arguments, root, driver, target, resume_session)
     inflight_path: list[Path] = []
+
+    def keep_settings(session_id: str | None) -> None:
+        if session_id and not arguments.no_ledger:
+            record_settings(
+                root, agent=target, session_id=session_id, settings=settings
+            )
 
     def remember(session_id: str) -> None:
         # Written while the sub-agent is still talking, because the process may
         # be killed from outside and then nothing later in this function runs.
         if arguments.no_ledger:
             return
+        keep_settings(session_id)
         try:
             inflight_path.append(
                 record_inflight(
@@ -1034,7 +1104,8 @@ def _dispatch(
         question=question,
         cwd=root,
         permission=arguments.permission,
-        model=arguments.model,
+        model=settings.model,
+        effort=settings.effort,
         timeout=arguments.timeout,
         max_runtime=arguments.max_runtime,
         permission_mode=arguments.permission_mode,
@@ -1044,7 +1115,9 @@ def _dispatch(
         resume_session=resume_session,
         on_session_id=remember,
     )
-    driver = driver_for(target)
+    # A preassigned handle is resumable before the sub-agent says a word, so
+    # its settings must be on disk before it runs too.
+    keep_settings(preassigned or resume_session)
     # The receipt is taken in the sub-agent's own working directory, not the
     # room root: reporting on a directory the work never happened in is worse
     # than reporting nothing.
@@ -1066,6 +1139,7 @@ def _dispatch(
             resume_session=resume_session,
             changed=changed_since(before, status_lines(workdir)),
             inflight=inflight_path,
+            keep_settings=keep_settings,
         )
     except DriverError:
         _record_ledger(
@@ -1085,6 +1159,7 @@ def _dispatch(
 
     changed = changed_since(before, status_lines(workdir))
     status = "ok" if result.ok else "error"
+    keep_settings(result.session_id)
     ledger_path = _record_ledger(
         arguments,
         root,
@@ -1107,6 +1182,8 @@ def _dispatch(
         "sender": None if sender is None else sender.value,
         "session_id": result.session_id,
         "resumed_from": resume_session,
+        "model": settings.model,
+        "effort": settings.effort,
         "exit_code": result.exit_code,
         "text": result.text,
         "stderr": result.stderr,
@@ -1130,6 +1207,7 @@ def _timed_out(
     resume_session: str | None,
     changed: tuple[str, ...],
     inflight: list[Path],
+    keep_settings,
 ) -> dict[str, object]:
     """Report a cut-short dispatch as a result, not as a bare error.
 
@@ -1149,6 +1227,7 @@ def _timed_out(
         or resume_session
         or preassigned
     )
+    keep_settings(session_id)
     ledger_path = _record_ledger(
         arguments,
         root,
@@ -1173,6 +1252,8 @@ def _timed_out(
         "sender": None if sender is None else sender.value,
         "session_id": session_id,
         "resumed_from": resume_session,
+        "model": request.model,
+        "effort": request.effort,
         "exit_code": -1,
         "text": salvaged.text,
         "stderr": error.stderr.strip(),
@@ -1224,6 +1305,7 @@ def _record_ledger(
             session_id=session_id,
             related_docs=related_docs,
             model=request.model,
+            effort=request.effort,
             exit_code=exit_code,
             status=status,
             changed_files=changed_files,
@@ -1408,12 +1490,12 @@ def _configure_utf8(stream: TextIO) -> None:
 AI_HELP = """---
 name: ai-room
 description: >
-  Coordinate one Codex, one Claude, and one opencode session headlessly.
+  Coordinate one Codex, one Claude, opencode, and dsh session headlessly.
   Dispatch a sub-agent task (ask), resume a cut-short dispatch (resume), or
   run the mailbox protocol (join/wait/send/reply/status/leave). machine_only:
   every command always prints one JSON envelope to stdout; failures go to
   stderr as an envelope with error.code. Use when the user wants to consult
-  another AI, dispatch a task to opencode, or continue a killed dispatch.
+  another AI, dispatch a task to opencode (dsh only when the user explicitly allows), or continue a killed dispatch.
 ai_help_version: 0.1.0
 tool_version: 0.1.0
 ---
@@ -1422,7 +1504,7 @@ tool_version: 0.1.0
 
 Use this tool when the user asks to:
 - 把方案交给对面那个 peer 审（你是 claude 就问 codex，是 codex 就问 claude）
-- 派一个边界清楚的任务给 opencode 执行
+- 派一个边界清楚的任务给 opencode 执行（dsh 仅在用户明确允许时）
 - 续接一个被掐断的派发（超时的正确动作是 resume，不是重发同一条 ask）
 - 开两个窗口互当顾问（信箱模式 join/wait/send/reply）
 
@@ -1433,18 +1515,22 @@ Do NOT use for:
 ## Quick Reference
 
 - **咨询决策者（只读）:** `ai-room ask --to codex --question "..." --cwd <project>`
-- **派 opencode 执行:** `ai-room ask --to opencode --permission workspace-write --question "..." --cwd <project>`
+- **派 opencode 执行（默认）:** `ai-room ask --to opencode --permission workspace-write --question "..." --cwd <project>`
+- **派 dsh 执行（需用户明确允许）:** `ai-room ask --to dsh --permission workspace-write --question "..." --cwd <project>`
 - **续接被掐断的派发:** `ai-room resume --to codex --session <id> --cwd <project>`
 
 ## Command Reference
 
-- `ask --to claude|codex|opencode --question TEXT [--related-doc PATH]... [--permission read-only|workspace-write|full-access] [--cwd DIR] [--timeout SEC] [--max-runtime SEC] [--no-ledger]`
+- `ask --to claude|codex|opencode|dsh --question TEXT [--related-doc PATH]... [--permission read-only|workspace-write|full-access] [--model MODEL] [--effort LEVEL] [--cwd DIR] [--timeout SEC] [--max-runtime SEC] [--no-ledger]`
   - 必填：`--to`、`--question`。默认 `read-only`。
-  - 成功：rc 0，stdout 信封 `data.result` 含 agent/status/text/changed_files/session_id/resume_command/ledger。
+  - 不给 `--model`/`--effort` 时用包内 `resources/models.toml` 的默认（决策者是最强档 + max；opencode 用它自己的默认）。
+    `--effort` 取值 low|medium|high|xhigh|max（codex 另有 ultra；opencode 传给 `--variant`）。
+  - 成功：rc 0，stdout 信封 `data.result` 含 agent/status/model/effort/text/changed_files/session_id/resume_command/ledger。
   - 失败或超时：rc 1，stderr 信封 `error.code=E_EXTERNAL_TOOL`，`error.details` 含完整结果，
     `error.suggestion` 是可续接的 `ai-room resume ...` 命令。
 - `resume [--to ...] [--session ID] [--question TEXT] ...`
   - 不给 --session 续接本房间最近一个被掐断的派发；给 --session 必须同时给 --to。
+  - 模型和思考档位沿用该会话上一轮的（显式给 `--model`/`--effort` 才覆盖）。
 - `join AGENT [--room NAME]` / `wait` / `send` / `reply` / `status` / `leave`（信箱协议，见 SKILL.md）
 
 ## Input / Output
@@ -1455,7 +1541,7 @@ Do NOT use for:
 
 ## Side Effects & Safety
 
-- `ask` / `resume`：启动一个真实的子 agent（claude/codex/opencode），**按整轮计费**。
+- `ask` / `resume`：启动一个真实的子 agent（claude/codex/opencode/dsh），**按整轮计费**。
   超时那一轮已计费——续接（resume），绝不重发。写台账 `.ai-room/ledger.md`（`--no-ledger` 关闭）。
 - `join/wait/send/reply/status/leave`：只读写 `%LOCALAPPDATA%/ai-room` 的房间库，不碰项目文件。
 - `wait` 是故意阻塞且静默的；中断只结束本次等待，不丢任务、不离开房间（E_INTERRUPTED，可安全重跑）。

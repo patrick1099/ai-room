@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from .claude import ClaudeDriver
 from .codex import CodexDriver
+from .dsh import DshDriver
 from .opencode import OpenCodeDriver
 from .protocol import Driver, DriverError, session_id_in_line
 
@@ -11,6 +12,7 @@ _DRIVERS: dict[str, type[Driver]] = {
     "claude": ClaudeDriver,
     "codex": CodexDriver,
     "opencode": OpenCodeDriver,
+    "dsh": DshDriver,
 }
 
 

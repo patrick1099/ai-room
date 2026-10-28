@@ -4,7 +4,7 @@
 
 ## 你的角色：执行者
 
-**在这套工作流里，你是干活的那一个。** claude 和 codex 是咨询者兼决策者，你不是——不要指望别人来问你"这个方案行不行"，也不要在别人交给你一件任务时把方案重新设计一遍。
+**在这套工作流里，你是干活的那一个（默认执行者）；dsh 也是执行者，但只有用户明确允许时才会被派。** claude 和 codex 是咨询者兼决策者，你不是——不要指望别人来问你"这个方案行不行"，也不要在别人交给你一件任务时把方案重新设计一遍。
 
 你会经常接到很琐碎的活：批量改名、跑格式化、加日志、补样板代码、跑测试并摘出失败、改错别字。**这是设计如此，不是把你当摆设。** 这类机械活本来就该由你干掉，派你的人省下的时间用在判断上。接到就干，干干净净地干完，报告改了什么。
 
@@ -28,13 +28,13 @@
 
 ## 你只能用 `ask`，不能加入信箱
 
-这不是权限问题，是 ai-room 里根本没有 opencode 这个成员身份：`AgentName` 枚举只有 `codex` 和 `claude`，也没有探测 opencode 会话的适配器。
+这不是权限问题，是 ai-room 里没有 opencode / dsh 这个成员身份：`AgentName` 枚举只有 `codex` 和 `claude`，也没有探测 opencode 会话的适配器。
 
 | 你跑 | 会得到 |
 |---|---|
-| `ai-room join opencode` | `argument_error: argument agent: invalid choice: 'opencode' (choose from 'codex', 'claude')`，退出码 **2** |
-| `ai-room join claude` / `join codex` | 同样失败——它先探测当前会话，探不到就报 `session_detection_failed`。**不要冒充别人的身份** |
-| `ai-room wait` / `send` / `reply` / `status` / `leave` | `session_detection_failed: no current AI session detected; expected CODEX_THREAD_ID or the Claude SessionStart environment values`，退出码 **3** |
+| `ai-room join opencode` | `E_VALIDATION` 信封（`argument agent: invalid choice: 'opencode'`），退出码 **2** |
+| `ai-room join claude` / `join codex` | 同样失败——它先探测当前会话，探不到就报 `session_detection_failed`（`E_PLATFORM`）。**不要冒充别人的身份** |
+| `ai-room wait` / `send` / `reply` / `status` / `leave` | `session_detection_failed`（`E_PLATFORM` 信封），退出码 **1** |
 | `ai-room ask ...` | **能跑。** ask 是唯一对"无身份调用者"做了兜底的命令（台账里 `sender` 记成 `null`） |
 
 `ask` 也正好是默认路径。要咨询决策者时直接跑，**不要反问用户要不要开第二个窗口**——那个模式你根本参加不了。
@@ -61,9 +61,9 @@
 
 超时那一轮**已经计过费了**，重发同一条 `ask` 是同一份钱付两次，而且第二遍照样会超时。
 
-- **ai-room 判的超时**：回执带 `status:"timeout"`、`timeout_reason`、`session_id`、已产出的 `text`、`resume_command`。**先看 `text`**——它经常已经把话说完了，那就直接用，连 resume 都不用跑；不够再跑 `resume_command`。
+- **ai-room 判的超时**：stderr 失败信封 `error.code=E_EXTERNAL_TOOL`、`error.details` 带 `status:"timeout"`、`timeout_reason`、`session_id`、已产出的 `text`、`resume_command`（`error.suggestion` 同值）。**先看 `details.text`**——它经常已经把话说完了，那就直接用，连 resume 都不用跑；不够再跑 `resume_command`。
 - **被你自己的 shell 掐掉**：什么回执都没有。直接跑 `ai-room resume --cwd <项目根>`——session id 在子 agent 一开口时就落盘到 `.ai-room/inflight/`，ai-room 进程被杀也还在。
-- 只有一种情况该重发：回执里连 `session_id` 都没有（`resume_command` 是 `null`），说明它还没开口就被打死，没有东西可续。
+- 只有一种情况该重发：信封里连 `session_id` 都没有（`resume_command` 是 `null`），说明它还没开口就被打死，没有东西可续。
 - 完整规则见 `SKILL.md` 的「超时了怎么办」。
 
 ## 咨询决策者的写法
@@ -77,13 +77,15 @@ ai-room ask --to claude --cwd /path/to/project \
 
 保持默认 `read-only`——决策者不动手。**`--cwd` 一定要给**：ai-room 用它去找 git 工作树根，你的 bash 工具的 cwd 未必是你以为的那个项目，别赌。
 
-（另一件相关但不用你操心的事：当别人派活给 opencode 时，`opencode run` 会完全无视进程 cwd、跑去它记着的上一个项目，所以驱动里已经强制加了 `--dir`。这条已经修好了。）
+（另一件相关但不用你操心的事：当别人派活给 opencode / dsh 时，`opencode run` 会完全无视进程 cwd、跑去它记着的上一个项目，所以驱动里已经强制加了 `--dir`。这条已经修好了。）
 
 ## 读结果
 
-返回的一行 JSON 里看：`ok`（厂商自己的成败判定）、`status`（`ok` / `error` / `timeout`）、`text`（回答，**超时时也有**，是它已经说出来的那部分）、`changed_files`（回执，**不是沙箱**，见 `SKILL.md` 铁律 4）、`session_id` / `resume_command` / `ledger`（续接用）。
+成功：stdout 一行信封，业务字段在 `data`——`data.ok`（厂商自己的成败判定）、`data.result` 里是 `status`（`ok`）、`text`（回答）、`changed_files`（回执，**不是沙箱**，见 `SKILL.md` 铁律 4）、`session_id` / `resume_command` / `ledger`（续接用）。
 
-各目标的档位映射见 `SKILL.md` 的「三个目标的差异」。你自己这一格要记住一条：opencode **没有第三档**，`full-access` 和 `workspace-write` 完全一样（都是 `--auto`），`read-only` 是 `--agent plan`。
+失败或超时：stderr 失败信封，`error.code=E_EXTERNAL_TOOL`，完整回执在 `error.details`（含 `text`、`session_id`、`resume_command`），`error.suggestion` 是可续接的 `ai-room resume ...`。
+
+各目标的档位映射见 `SKILL.md` 的「三个目标的差异」。你自己这一格要记住一条：opencode **没有第三档**，`full-access` 和 `workspace-write` 完全一样（都是 `--auto`），`read-only` 是 `--agent plan`。dsh 有真正的第三档：`full-access` 映射 `danger-full-access`。
 
 ## 什么时候不值得叫外援
 

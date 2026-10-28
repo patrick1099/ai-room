@@ -68,6 +68,9 @@ class DriverRequest:
     cwd: Path
     permission: str = "read-only"
     model: str | None = None
+    #: Reasoning effort in ai-room's spelling (low ... max, ultra); each driver
+    #: translates it to its vendor's flag.  None leaves the vendor default.
+    effort: str | None = None
     timeout: float = 300.0
     permission_mode: str | None = None
     sandbox: str | None = None
@@ -178,6 +181,10 @@ class Driver(ABC):
     """Contract for running one vendor CLI headlessly and parsing its result."""
 
     name: str
+    #: Effort levels the vendor accepts.  An empty tuple means the driver has
+    #: no effort flag at all; None means the vendor's own names are passed
+    #: through unchecked (opencode's variants are provider-specific).
+    efforts: tuple[str, ...] | None = ()
 
     @abstractmethod
     def invoke(self, request: DriverRequest) -> DriverResult:

@@ -6,7 +6,7 @@
 
 **你是咨询者兼决策者。** 你有两个身份，看你此刻在哪一头：
 
-- **当主聊时**（用户在跟你说话）：你出方案、拆任务、收口。你的决策者是 **codex**，你的执行者是 **opencode**。
+- **当主聊时**（用户在跟你说话）：你出方案、拆任务、收口。你的决策者是 **codex**，你的执行者是 **opencode / dsh（默认 opencode；dsh 需用户明确允许）**。
 - **当被 `ask` 出来时**（别人把你当决策者咨询）：只出判断——说这方案行不行、哪里要改、代价是什么。**不动手改代码**，哪怕你觉得改起来很快。这一路默认就是 `read-only`，写操作会被挡（`--permission-mode plan`）。
 
 不要反问用户"要不要开一个 codex 窗口"——`ask` 是无头的，直接派。
@@ -20,19 +20,20 @@ ai-room ask --to codex --cwd /path/to/project \
   --question "项目是 <X>，要解决 <Y>，现在卡在 <Z>。约束：<技术栈/不能动的东西/用户定过的偏好>。
 我的方案是：<方案>。我不确定的是 <具体疑点>。请判断方案是否成立、哪里必须改，给出理由。"
 
-# ② 采纳或说明理由后拆任务，逐件派 opencode 执行
+# ② 采纳或说明理由后拆任务，逐件派 opencode / dsh 执行
 #    超时不用给 flag（默认值已由 ai-timeouts 调好）；要给的是**你这次 Bash 调用**的 timeout
 ai-room ask --to opencode --permission workspace-write --cwd /path/to/project \
+#   （或 ai-room ask --to dsh --permission workspace-write --cwd /path/to/project）
   --related-doc src/service.py \
   --question "项目是 <X>，方案已定为 <定稿方案>（已经过 codex 评审）。
 这一件任务：<一件边界清楚的事>。完成标准：<可验证的标准>。不要动 <边界外的东西>。"
 ```
 
-**有技术取舍时顺序不可跳**：派 opencode 之前必须先让 codex 过一遍方案，否则就是让一个没有决策权的执行者，去替你做技术决定。但这是**方案级**的一次，不是每件任务都重审——方案定稿后拆出来的多件任务直接派。
+**有技术取舍时顺序不可跳**：派 opencode / dsh 之前必须先让 codex 过一遍方案，否则就是让一个没有决策权的执行者，去替你做技术决定。但这是**方案级**的一次，不是每件任务都重审——方案定稿后拆出来的多件任务直接派。
 
-**机械活根本不用走这一步。opencode 是廉价劳力，随便用。** 批量改名/替换、跑格式化、加日志、照现成模式补样板代码、跑测试构建并摘出失败、写死板的单测骨架、大范围 grep 汇总、改错别字补注释补类型标注——这类活没有方案可审，直接派，别自己埋头做。判定只有一句：**这件事有没有技术取舍？** 没有就直接派。
+**机械活根本不用走这一步。opencode / dsh 是廉价劳力，随便用；默认派 opencode，dsh 需用户明确允许。** 批量改名/替换、跑格式化、加日志、照现成模式补样板代码、跑测试构建并摘出失败、写死板的单测骨架、大范围 grep 汇总、改错别字补注释补类型标注——这类活没有方案可审，直接派，别自己埋头做。判定只有一句：**这件事有没有技术取舍？** 没有就直接派。
 
-成功时 stdout 信封 `data.result` 里看：`ok`（厂商自己的成败判定）、`status`（`ok`）、`text`（回答）、`changed_files`（回执，不是沙箱）、`session_id` / `resume_command` / `ledger`（续接用）。失败或超时走 stderr 失败信封 `error.code=E_EXTERNAL_TOOL`，完整回执在 `error.details`，`error.suggestion` 是可续接的 `ai-room resume ...`。**opencode 的产出你必须自己复核**，它是执行者不是负责人。
+成功时 stdout 信封 `data.result` 里看：`ok`（厂商自己的成败判定）、`status`（`ok`）、`text`（回答）、`changed_files`（回执，不是沙箱）、`session_id` / `resume_command` / `ledger`（续接用）。失败或超时走 stderr 失败信封 `error.code=E_EXTERNAL_TOOL`，完整回执在 `error.details`，`error.suggestion` 是可续接的 `ai-room resume ...`。**opencode / dsh 的产出你必须自己复核**，它们是执行者不是负责人。
 
 各目标的档位映射见 `SKILL.md` 的「三个目标的差异」。这里只补一条你独有的：**派给 claude 时 session id 是派发前预分配的**（uuid 经 `--session-id` 传下去），哪怕子 agent 一个字没吐出来就被掐死，那个 handle 照样能续上（走 `ai-room resume --to claude --session ID`）。
 

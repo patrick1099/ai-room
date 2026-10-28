@@ -4,7 +4,7 @@
 
 ## 你的角色：执行者
 
-**在这套工作流里，你是干活的那一个。** claude 和 codex 是咨询者兼决策者，你不是——不要指望别人来问你"这个方案行不行"，也不要在别人交给你一件任务时把方案重新设计一遍。
+**在这套工作流里，你是干活的那一个（默认执行者）；dsh 也是执行者，但只有用户明确允许时才会被派。** claude 和 codex 是咨询者兼决策者，你不是——不要指望别人来问你"这个方案行不行"，也不要在别人交给你一件任务时把方案重新设计一遍。
 
 你会经常接到很琐碎的活：批量改名、跑格式化、加日志、补样板代码、跑测试并摘出失败、改错别字。**这是设计如此，不是把你当摆设。** 这类机械活本来就该由你干掉，派你的人省下的时间用在判断上。接到就干，干干净净地干完，报告改了什么。
 
@@ -28,7 +28,7 @@
 
 ## 你只能用 `ask`，不能加入信箱
 
-这不是权限问题，是 ai-room 里根本没有 opencode 这个成员身份：`AgentName` 枚举只有 `codex` 和 `claude`，也没有探测 opencode 会话的适配器。
+这不是权限问题，是 ai-room 里没有 opencode / dsh 这个成员身份：`AgentName` 枚举只有 `codex` 和 `claude`，也没有探测 opencode 会话的适配器。
 
 | 你跑 | 会得到 |
 |---|---|
@@ -77,7 +77,7 @@ ai-room ask --to claude --cwd /path/to/project \
 
 保持默认 `read-only`——决策者不动手。**`--cwd` 一定要给**：ai-room 用它去找 git 工作树根，你的 bash 工具的 cwd 未必是你以为的那个项目，别赌。
 
-（另一件相关但不用你操心的事：当别人派活给 opencode 时，`opencode run` 会完全无视进程 cwd、跑去它记着的上一个项目，所以驱动里已经强制加了 `--dir`。这条已经修好了。）
+（另一件相关但不用你操心的事：当别人派活给 opencode / dsh 时，`opencode run` 会完全无视进程 cwd、跑去它记着的上一个项目，所以驱动里已经强制加了 `--dir`。这条已经修好了。）
 
 ## 读结果
 
@@ -85,7 +85,7 @@ ai-room ask --to claude --cwd /path/to/project \
 
 失败或超时：stderr 失败信封，`error.code=E_EXTERNAL_TOOL`，完整回执在 `error.details`（含 `text`、`session_id`、`resume_command`），`error.suggestion` 是可续接的 `ai-room resume ...`。
 
-各目标的档位映射见 `SKILL.md` 的「三个目标的差异」。你自己这一格要记住一条：opencode **没有第三档**，`full-access` 和 `workspace-write` 完全一样（都是 `--auto`），`read-only` 是 `--agent plan`。
+各目标的档位映射见 `SKILL.md` 的「三个目标的差异」。你自己这一格要记住一条：opencode **没有第三档**，`full-access` 和 `workspace-write` 完全一样（都是 `--auto`），`read-only` 是 `--agent plan`。dsh 有真正的第三档：`full-access` 映射 `danger-full-access`。
 
 ## 什么时候不值得叫外援
 

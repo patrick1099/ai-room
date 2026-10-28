@@ -9,9 +9,14 @@ import pytest
 
 from ai_room.drivers.claude import ClaudeDriver, _parse_stream
 from ai_room.drivers.codex import CodexDriver, _parse_jsonl as _parse_codex_jsonl
+from ai_room.drivers.dsh import (
+    DshDriver,
+    _binary_command,
+    _parse_jsonl as _parse_dsh_jsonl,
+)
 from ai_room.drivers.opencode import (
     OpenCodeDriver,
-    _binary_command,
+    _binary_command as _binary_opencode_command,
     _parse_jsonl as _parse_opencode_jsonl,
 )
 from ai_room.drivers.protocol import (
@@ -33,10 +38,11 @@ def test_driver_for_returns_known_drivers() -> None:
     assert driver_for("claude").name == "claude"
     assert driver_for("codex").name == "codex"
     assert driver_for("opencode").name == "opencode"
+    assert driver_for("dsh").name == "dsh"
 
 
 def test_list_drivers_matches_expected() -> None:
-    assert list_drivers() == ("claude", "codex", "opencode")
+    assert list_drivers() == ("claude", "codex", "opencode", "dsh")
 
 
 def test_unknown_driver_raises() -> None:
@@ -135,6 +141,34 @@ def test_opencode_parser_dedupes_streamed_fragments() -> None:
     assert text == "hello\n world"
 
 
+def test_dsh_parser_handles_real_jsonl() -> None:
+    session_id, text = _parse_dsh_jsonl(_fixture("driver_dsh.jsonl"))
+    assert session_id == "session-abc"
+    assert text == "最终"
+
+
+def test_dsh_parser_joins_deltas_when_run_completed_is_missing() -> None:
+    payload = (
+        '{"type":"session.started","session_id":"d-1","payload":{"resumed":false}}\n'
+        '{"type":"assistant.delta","session_id":"d-1","payload":{"text":"hel"}}\n'
+        '{"type":"assistant.delta","session_id":"d-1","payload":{"text":"lo"}}\n'
+    )
+    session_id, text = _parse_dsh_jsonl(payload)
+    assert session_id == "d-1"
+    assert text == "hello"
+
+
+def test_dsh_parser_prefers_last_completed_text() -> None:
+    payload = (
+        '{"type":"session.started","session_id":"d-1","payload":{"resumed":false}}\n'
+        '{"type":"assistant.delta","session_id":"d-1","payload":{"text":"delta"}}\n'
+        '{"type":"run.completed","session_id":"d-1","payload":{"text":"first"}}\n'
+        '{"type":"run.completed","session_id":"d-1","payload":{"text":"last"}}\n'
+    )
+    session_id, text = _parse_dsh_jsonl(payload)
+    assert session_id == "d-1"
+    assert text == "last"
+
 def test_driver_request_read_only_defaults_true() -> None:
     request = DriverRequest(question="q", cwd=Path("."))
     assert request.read_only is True
@@ -196,6 +230,9 @@ def _capture_call(
     monkeypatch.setattr(f"{module}.run_cli", fake_run)
     if hasattr(__import__(module, fromlist=["x"]), "_is_git_repo"):
         monkeypatch.setattr(f"{module}._is_git_repo", lambda cwd: True)
+    if hasattr(__import__(module, fromlist=["x"]), "_desktop_bundled"):
+        # Keep argv-shape tests independent of whatever the dev machine has installed.
+        monkeypatch.setattr(f"{module}._desktop_bundled", lambda: [])
     driver.invoke(request)
     return captured
 
@@ -581,7 +618,7 @@ def test_opencode_agent_name_does_not_cost_write_access(monkeypatch) -> None:
 
 
 def test_binary_command_passes_a_real_executable_through() -> None:
-    assert _binary_command(r"C:\tools\opencode.exe") == [r"C:\tools\opencode.exe"]
+    assert _binary_opencode_command(r"C:\tools\opencode.exe") == [r"C:\tools\opencode.exe"]
 
 
 @pytest.mark.skipif(os.name != "nt", reason="npm shim resolution is Windows-only")
@@ -597,7 +634,7 @@ def test_binary_command_resolves_an_npm_shim_to_the_real_exe(tmp_path: Path) -> 
     real.parent.mkdir(parents=True)
     real.write_bytes(b"MZ")
 
-    assert _binary_command(str(shim)) == [str(real)]
+    assert _binary_opencode_command(str(shim)) == [str(real)]
 
 
 @pytest.mark.skipif(os.name != "nt", reason="npm shim resolution is Windows-only")
@@ -609,7 +646,7 @@ def test_binary_command_reads_the_target_out_of_an_unfamiliar_shim(
     shim = tmp_path / "opencode.cmd"
     shim.write_text(f'@ECHO off\r\n"{real}" %*\r\n', encoding="utf-8")
 
-    assert _binary_command(str(shim)) == [str(real)]
+    assert _binary_opencode_command(str(shim)) == [str(real)]
 
 
 @pytest.mark.skipif(os.name != "nt", reason="cmd.exe argument parsing is Windows-only")
@@ -632,6 +669,50 @@ def test_cmd_shim_would_have_truncated_a_multiline_prompt() -> None:
     assert "line two" not in through_cmd.stdout
 
 
+@pytest.mark.skipif(os.name != "nt", reason="npm shim resolution is Windows-only")
+def test_dsh_binary_command_resolves_an_npm_shim_to_node_and_bin_js(
+    tmp_path: Path,
+) -> None:
+    """Launch the real node + dsh bin.js instead of routing through cmd."""
+    shim = tmp_path / "dsh.cmd"
+    shim.write_text(
+        '@ECHO off\r\n"%dp0%\\node.exe" "%dp0%\\node_modules\\@deepseek-ai\\dsh\\lib\\bin.js" %*\r\n',
+        encoding="utf-8",
+    )
+    node = tmp_path / "node.exe"
+    node.write_bytes(b"MZ")
+    bin_js = (
+        tmp_path / "node_modules" / "@deepseek-ai" / "dsh" / "lib" / "bin.js"
+    )
+    bin_js.parent.mkdir(parents=True)
+    bin_js.write_text("", encoding="utf-8")
+
+    assert _binary_command(str(shim)) == [str(node), str(bin_js)]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="npm shim resolution is Windows-only")
+def test_dsh_binary_command_reads_targets_out_of_an_unfamiliar_shim(
+    tmp_path: Path,
+) -> None:
+    """The fallback reads quoted node.exe and bin.js paths from the shim."""
+    node = tmp_path / "elsewhere" / "node.exe"
+    node.parent.mkdir(parents=True)
+    node.write_bytes(b"MZ")
+    bin_js = tmp_path / "node_modules" / "@deepseek-ai" / "dsh" / "lib" / "bin.js"
+    bin_js.parent.mkdir(parents=True)
+    bin_js.write_text("", encoding="utf-8")
+    shim = tmp_path / "dsh.cmd"
+    shim.write_text(
+        f'@ECHO off\r\n"{node}" "{bin_js}" %*\r\n',
+        encoding="utf-8",
+    )
+
+    assert _binary_command(str(shim)) == [str(node), str(bin_js)]
+
+
+def test_dsh_binary_command_passes_a_real_executable_through() -> None:
+    assert _binary_command(r"C:\tools\dsh.exe") == [r"C:\tools\dsh.exe"]
+
 def test_opencode_model_flag(monkeypatch) -> None:
     argv = _capture_argv(
         monkeypatch,
@@ -642,11 +723,78 @@ def test_opencode_model_flag(monkeypatch) -> None:
     assert _value_at(argv, "--model") == "opencode-1"
 
 
+# ---- dsh ----
+
+def test_dsh_argv_profile_format_cwd_permission(monkeypatch) -> None:
+    project = Path("/tmp/project")
+    request = DriverRequest(question="q", cwd=project)
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.dsh",
+        DshDriver(),
+        request,
+    )
+    assert argv[:5] == [
+        "binary",
+        "--profile",
+        "dsh-agent",
+        "--format",
+        "jsonl",
+    ]
+    assert _value_at(argv, "--cwd") == str(project)
+    assert _value_at(argv, "--permission") == "read-only"
+    assert argv[-1] == compose_prompt(request)
+
+
+def test_dsh_workspace_write_permission(monkeypatch) -> None:
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.dsh",
+        DshDriver(),
+        DriverRequest(
+            question="q", cwd=Path("."), permission="workspace-write"
+        ),
+    )
+    assert _value_at(argv, "--permission") == "workspace-write"
+
+
+def test_dsh_full_access_permission(monkeypatch) -> None:
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.dsh",
+        DshDriver(),
+        DriverRequest(question="q", cwd=Path("."), permission="full-access"),
+    )
+    assert _value_at(argv, "--permission") == "full-access"
+
+
+def test_dsh_model_flag(monkeypatch) -> None:
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.dsh",
+        DshDriver(),
+        DriverRequest(question="q", cwd=Path("."), model="dsh-model"),
+    )
+    assert _value_at(argv, "--model") == "dsh-model"
+
+
+def test_dsh_resume_flag(monkeypatch) -> None:
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.dsh",
+        DshDriver(),
+        DriverRequest(
+            question="continue", cwd=Path("."), resume_session="sess-9"
+        ),
+    )
+    assert _value_at(argv, "--session") == "sess-9"
+
 # --- resuming: continue a paid-for turn instead of paying for it twice ---
 
 _RESUME_CASES = (
     ("ai_room.drivers.claude", ClaudeDriver, "-r"),
     ("ai_room.drivers.opencode", OpenCodeDriver, "--session"),
+    ("ai_room.drivers.dsh", DshDriver, "--session"),
 )
 
 
@@ -721,6 +869,21 @@ def test_resumed_result_keeps_the_handle_even_if_the_stream_omits_it(
     assert result.session_id == "ses-keep"
 
 
+def test_dsh_resumed_result_keeps_the_handle_even_if_the_stream_omits_it(
+    monkeypatch,
+) -> None:
+    """A dsh resume that never echoes the id must still keep the known handle."""
+    monkeypatch.setattr("ai_room.drivers.dsh.find_binary", lambda *a, **k: "b")
+    monkeypatch.setattr(
+        "ai_room.drivers.dsh.run_cli",
+        lambda *a, **k: _fake_run([], Path("."), 1, "dsh"),
+    )
+    result = DshDriver().invoke(
+        DriverRequest(question="q", cwd=Path("."), resume_session="ses-keep")
+    )
+    assert result.session_id == "ses-keep"
+
+
 # --- streaming: the handle must reach the caller before the run ends ---
 
 
@@ -730,6 +893,7 @@ def test_resumed_result_keeps_the_handle_even_if_the_stream_omits_it(
         ("ai_room.drivers.claude", ClaudeDriver, '{"session_id":"a-1"}'),
         ("ai_room.drivers.codex", CodexDriver, '{"thread_id":"a-1"}'),
         ("ai_room.drivers.opencode", OpenCodeDriver, '{"sessionID":"a-1"}'),
+        ("ai_room.drivers.dsh", DshDriver, '{"session_id":"a-1"}'),
     ),
 )
 def test_driver_reports_the_session_id_mid_run(
@@ -759,6 +923,7 @@ def test_driver_reports_the_session_id_mid_run(
         ("ai_room.drivers.claude", ClaudeDriver),
         ("ai_room.drivers.codex", CodexDriver),
         ("ai_room.drivers.opencode", OpenCodeDriver),
+        ("ai_room.drivers.dsh", DshDriver),
     ),
 )
 def test_driver_forwards_both_budgets(monkeypatch, module: str, driver_cls) -> None:
@@ -798,6 +963,14 @@ def test_driver_forwards_both_budgets(monkeypatch, module: str, driver_cls) -> N
             "o-1",
             "partial",
         ),
+        (
+            DshDriver(),
+            '{"type":"session.started","session_id":"d-1","payload":{"resumed":false}}\n'
+            '{"type":"assistant.delta","session_id":"d-1","payload":{"text":"partial"}}\n'
+            '{"type":"assistant.delta","session_id":"d-1","pay',
+            "d-1",
+            "partial",
+        ),
     ),
 )
 def test_parse_partial_salvages_a_cut_stream(
@@ -807,3 +980,191 @@ def test_parse_partial_salvages_a_cut_stream(
     result = driver.parse_partial(stdout)
     assert result.session_id == session_id
     assert result.text == text
+
+
+# --- which codex binary: the desktop app ships a newer one outside PATH. ---
+
+
+def _fake_desktop(tmp_path: Path, monkeypatch, *hashes: str) -> list[str]:
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    out = []
+    for h in hashes:
+        exe = tmp_path / "OpenAI" / "Codex" / "bin" / h / "codex.exe"
+        exe.parent.mkdir(parents=True)
+        exe.write_bytes(b"")
+        out.append(str(exe))
+    return out
+
+
+def test_locate_codex_prefers_newer_desktop_copy(tmp_path: Path, monkeypatch) -> None:
+    """PATH holds a stale hand-installed codex; the app's copy is newer and must win."""
+    import ai_room.drivers.codex as codex
+
+    (desktop,) = _fake_desktop(tmp_path, monkeypatch, "abc123")
+    monkeypatch.setattr(codex, "find_binary", lambda *a, **k: "C:/old/codex.exe")
+    versions = {"C:/old/codex.exe": (0, 146, 0), desktop: (0, 155, 0)}
+    monkeypatch.setattr(codex, "_codex_version", versions.__getitem__)
+    assert codex._locate_codex("codex", ("codex",)) == desktop
+
+
+def test_locate_codex_keeps_path_copy_when_it_is_newer_or_equal(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import ai_room.drivers.codex as codex
+
+    old, new = _fake_desktop(tmp_path, monkeypatch, "a", "b")
+    monkeypatch.setattr(codex, "find_binary", lambda *a, **k: "C:/npm/codex.cmd")
+    versions = {"C:/npm/codex.cmd": (0, 156, 1), old: (0, 150, 0), new: (0, 156, 1)}
+    monkeypatch.setattr(codex, "_codex_version", versions.__getitem__)
+    assert codex._locate_codex("codex", ("codex",)) == "C:/npm/codex.cmd"
+
+
+def test_locate_codex_uses_desktop_copy_when_path_has_none(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import ai_room.drivers.codex as codex
+
+    (desktop,) = _fake_desktop(tmp_path, monkeypatch, "abc123")
+
+    def missing(*a, **k):
+        raise DriverError("codex CLI not found on PATH")
+
+    monkeypatch.setattr(codex, "find_binary", missing)
+    assert codex._locate_codex("codex", ("codex",)) == desktop
+
+
+def test_locate_codex_without_desktop_app_is_plain_path_lookup(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import ai_room.drivers.codex as codex
+
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))          # no OpenAI\Codex under it
+    monkeypatch.setattr(codex, "find_binary", lambda *a, **k: "C:/only/codex.exe")
+    assert codex._locate_codex("codex", ("codex",)) == "C:/only/codex.exe"
+
+
+def test_unreadable_version_sorts_last(tmp_path: Path) -> None:
+    import ai_room.drivers.codex as codex
+
+    assert codex._codex_version(str(tmp_path / "nope.exe")) == (-1,)
+
+
+# ---- effort ----
+
+
+def test_claude_effort_flag(monkeypatch) -> None:
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.claude",
+        ClaudeDriver(),
+        DriverRequest(question="q", cwd=Path("."), effort="max"),
+    )
+    assert _value_at(argv, "--effort") == "max"
+
+
+def test_claude_streams_partial_messages_so_a_long_think_is_not_silence(
+    monkeypatch,
+) -> None:
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.claude",
+        ClaudeDriver(),
+        DriverRequest(question="q", cwd=Path(".")),
+    )
+    assert "--include-partial-messages" in argv
+
+
+def test_codex_effort_travels_as_config(monkeypatch) -> None:
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.codex",
+        CodexDriver(),
+        DriverRequest(question="q", cwd=Path("."), effort="max"),
+    )
+    assert 'model_reasoning_effort="max"' in _all_values(argv, "-c")
+
+
+def test_codex_resume_keeps_model_and_effort(monkeypatch) -> None:
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.codex",
+        CodexDriver(),
+        DriverRequest(
+            question="q",
+            cwd=Path("."),
+            model="some-model",
+            effort="max",
+            resume_session="thread-1",
+        ),
+    )
+    assert argv[1:4] == ["exec", "resume", "thread-1"]
+    assert _value_at(argv, "-m") == "some-model"
+    assert 'model_reasoning_effort="max"' in _all_values(argv, "-c")
+
+
+def test_opencode_effort_is_its_variant(monkeypatch) -> None:
+    argv = _capture_argv(
+        monkeypatch,
+        "ai_room.drivers.opencode",
+        OpenCodeDriver(),
+        DriverRequest(question="q", cwd=Path("."), effort="high"),
+    )
+    assert _value_at(argv, "--variant") == "high"
+
+
+@pytest.mark.parametrize(
+    "module, driver_cls, flag",
+    [
+        ("ai_room.drivers.claude", ClaudeDriver, "--effort"),
+        ("ai_room.drivers.opencode", OpenCodeDriver, "--variant"),
+    ],
+)
+def test_no_effort_means_no_effort_flag(
+    monkeypatch, module: str, driver_cls, flag: str
+) -> None:
+    argv = _capture_argv(
+        monkeypatch, module, driver_cls(), DriverRequest(question="q", cwd=Path("."))
+    )
+    assert flag not in argv
+
+
+def test_shipped_defaults_are_accepted_by_each_driver() -> None:
+    """Whatever models.toml says must be something the driver's flag takes."""
+    from ai_room.model_defaults import defaults_for
+
+    for driver_cls in (ClaudeDriver, CodexDriver, OpenCodeDriver):
+        effort = defaults_for(driver_cls.name).effort
+        if effort is not None and driver_cls.efforts is not None:
+            assert effort in driver_cls.efforts, driver_cls.name
+
+
+def test_decision_makers_have_a_default_model_and_effort() -> None:
+    """A consultation must not fall through to the vendor's own default."""
+    from ai_room.model_defaults import defaults_for
+
+    for agent in ("claude", "codex"):
+        settings = defaults_for(agent)
+        assert settings.model and settings.effort, agent
+
+
+def test_an_agent_without_a_table_uses_the_vendor_default(tmp_path: Path) -> None:
+    from ai_room.model_defaults import defaults_for
+
+    path = tmp_path / "models.toml"
+    path.write_text('[claude]\nmodel = "x"\n', encoding="utf-8")
+    assert defaults_for("opencode", path).model is None
+    assert defaults_for("claude", path).model == "x"
+    assert defaults_for("claude", path).effort is None
+
+
+def test_a_broken_defaults_file_is_an_error_not_a_silent_downgrade(
+    tmp_path: Path,
+) -> None:
+    from ai_room.model_defaults import ModelDefaultsError, defaults_for
+
+    path = tmp_path / "models.toml"
+    path.write_text("[claude\n", encoding="utf-8")
+    with pytest.raises(ModelDefaultsError):
+        defaults_for("claude", path)
+    with pytest.raises(ModelDefaultsError):
+        defaults_for("claude", tmp_path / "missing.toml")

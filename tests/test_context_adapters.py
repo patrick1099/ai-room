@@ -427,6 +427,46 @@ def test_claude_session_start_rejects_newlines(
     assert not env_file.exists()
 
 
+def test_claude_session_start_decodes_real_stdin_as_utf8(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "Kunlun-新架构-debug"
+    payload = {
+        "session_id": "session-123",
+        "transcript_path": str(project / "session-123.jsonl"),
+        "cwd": str(project),
+        "source": "startup",
+    }
+    encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    class _ConsoleStdin:
+        """Stand in for a sys.stdin whose text layer is not UTF-8."""
+
+        encoding = "gbk"
+        errors = "surrogateescape"
+        buffer = io.BytesIO(encoded)
+
+        def read(self) -> str:
+            raise AssertionError("the text layer must not be used")
+
+    monkeypatch.setattr(claude_session_start.sys, "stdin", _ConsoleStdin())
+
+    result = claude_session_start.main(
+        environ={"LOCALAPPDATA": str(tmp_path)},
+    )
+
+    assert result == 0
+    registry = (
+        tmp_path
+        / "ai-room"
+        / "claude-sessions"
+        / "session-123.json"
+    )
+    record = json.loads(registry.read_text(encoding="utf-8"))
+    assert record["cwd"] == str(project)
+
+
 def test_claude_session_start_atomically_replaces_registry_record(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

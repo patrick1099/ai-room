@@ -1,6 +1,6 @@
 ---
 name: ai-room
-description: 用本机 ai-room CLI 调动另一个 AI，默认走 `ask` 无头模式，两种用法——① **咨询决策者**：把自己的方案交给对面那个 peer 审（你是 claude 就问 codex，是 codex 就问 claude），让他说行不行、哪里要改；② **派 opencode 执行**：把拆好的任务交给它去做。角色固定不串岗：claude 和 codex 是咨询者兼决策者，opencode 只当执行者。**opencode 是廉价劳力，机械活随便派、鼓励派**；只有"有技术取舍"的活才要先让决策者过一遍方案，且那是方案级的一次，不是每件任务都重审。每次 ask 都要把场景上下文说全，子 agent 是零上下文的。当用户说"问问另一个 AI""让 codex 看看我的方案""派个子 agent 去做""opencode 跑一下"，或你要动手做一件有分量的事时使用。用户点名要"开两个窗口互当顾问 / 走信箱 / join"时才改用 join/wait/send/reply。派发超时后也读本 skill——超时的正确动作是 `ai-room resume` 续接，**不是**重发同一条 ask（那会把已经计过费的一轮重新买一遍）。
+description: 用本机 ai-room CLI 调动另一个 AI，默认走 `ask` 无头模式，两种用法——① **咨询决策者**：把自己的方案交给对面那个 peer 审（你是 claude 就问 codex，是 codex 就问 claude），让他说行不行、哪里要改；② **派 opencode / dsh 执行**：把拆好的任务交给它们去做。角色固定不串岗：claude 和 codex 是咨询者兼决策者，opencode 和 dsh 只当执行者。**默认执行者是 opencode；dsh 只有在用户明确允许时才能调用。** opencode / dsh 都是廉价劳力，机械活随便派、鼓励派；只有"有技术取舍"的活才要先让决策者过一遍方案，且那是方案级的一次，不是每件任务都重审。每次 ask 都要把场景上下文说全，子 agent 是零上下文的。当用户说"问问另一个 AI""让 codex 看看我的方案""派个子 agent 去做""opencode / dsh 跑一下"，或你要动手做一件有分量的事时使用。用户点名要"开两个窗口互当顾问 / 走信箱 / join"时才改用 join/wait/send/reply。派发超时后也读本 skill——超时的正确动作是 `ai-room resume` 续接，**不是**重发同一条 ask（那会把已经计过费的一轮重新买一遍）。
 ---
 
 # ai-room
@@ -13,9 +13,9 @@ description: 用本机 ai-room CLI 调动另一个 AI，默认走 `ask` 无头�
 |---|---|---|---|
 | **主聊** | 你——此刻正在服务用户的这一个 | 出方案、拆任务、收口，对用户负责 | — |
 | **决策者**（咨询对象） | **对面那个 peer**：你是 claude 就是 codex，你是 codex 就是 claude | 审你的方案、指出哪里要改、拍技术取舍 | 不派它干活，不给它写权限 |
-| **执行者** | **只有 opencode** | 接一件边界清楚的任务去做。**廉价劳力，机械活随便派** | 不问它决策，不让它定方案 |
+| **执行者** | **opencode / dsh（默认 opencode；dsh 需用户明确允许）** | 接一件边界清楚的任务去做。**廉价劳力，机械活随便派** | 不问它决策，不让它定方案 |
 
-claude 和 codex 是**咨询者兼决策者**；opencode **只当执行者**。这不是偏好，是这三方在本工作流里的固定角色。
+claude 和 codex 是**咨询者兼决策者**；opencode 和 dsh **只当执行者**。默认执行者是 opencode；dsh 只有在用户明确允许时才能调用。这不是偏好，是这几方在本工作流里的固定角色。
 
 ## `ask` 的两种用法
 
@@ -30,9 +30,9 @@ ai-room ask --to codex --question "<场景><我的方案><我不确定的点>" \
 
 保持默认 `read-only`。决策者不动手，给它写权限就是角色串岗。
 
-### 用法二 · 派 opencode 执行（可写）
+### 用法二 · 派 opencode / dsh 执行（可写）
 
-**opencode 是廉价劳力，随便用。** 凡是判断成分低的机械活，默认就该甩给它，别自己埋头做：批量改名/替换、跑格式化、加日志、照现成模式补样板代码、跑测试构建并把失败摘出来、写死板的单测骨架、大范围 grep 汇总、改错别字补注释补类型标注。
+**默认派 opencode；只有用户明确允许/点名 dsh 时才派 dsh。** opencode / dsh 都是廉价劳力，随便用。 凡是判断成分低的机械活，默认就该甩给它，别自己埋头做：批量改名/替换、跑格式化、加日志、照现成模式补样板代码、跑测试构建并把失败摘出来、写死板的单测骨架、大范围 grep 汇总、改错别字补注释补类型标注。
 
 ```bash
 ai-room ask --to opencode --question "<场景><这一件具体任务><完成标准><不要动什么>"   --permission workspace-write --related-doc <精确路径> --cwd <项目根>
@@ -40,13 +40,13 @@ ai-room ask --to opencode --question "<场景><这一件具体任务><完成标�
 
 ## 铁律：先咨询，后执行——但只对"有方案的活"
 
-**派 opencode 本身没有门槛，有门槛的是咨询。** 判定只有一句：
+**派 opencode / dsh 本身没有门槛，有门槛的是咨询。** 判定只有一句：
 
-> **这件事有没有技术取舍？** 没有 → 直接派 opencode，不用问任何人。有 → 先咨询决策者把方案定下来，再拆成任务派。
+> **这件事有没有技术取舍？** 没有 → 默认直接派 opencode；用户明确允许 dsh 时才派 dsh，不用问任何人。有 → 先咨询决策者把方案定下来，再拆成任务派。
 
 机械活不需要咨询，因为**根本没有方案可审**。这条铁律约束的是**方案**，不是每一次派发：
 
-- opencode 不许执行**没人审过的方案**；
+- opencode / dsh 不许执行**没人审过的方案**；
 - 但一个方案审过之后，从它拆出来的多件任务**不必每件重审**；
 - 派活时改个错别字、补个注释，那不是新方案，直接派。
 
@@ -56,8 +56,8 @@ ai-room ask --to opencode --question "<场景><这一件具体任务><完成标�
 2. `ask --to <peer>` 咨询：这方案行不行、哪里要改；
 3. 按意见修正——不同意就说明理由，你是主聊，最后由你收口；
 4. 把定稿方案拆成边界清楚、完成标准明确的任务；
-5. `ask --to opencode --permission workspace-write` 逐件派出去；
-6. 收回执，**自己复核**——opencode 是执行者，不是负责人。
+5. 默认 `ask --to opencode --permission workspace-write`；用户明确允许 dsh 时才 `ask --to dsh --permission workspace-write`，逐件派出去；
+6. 收回执，**自己复核**——opencode / dsh 是执行者，不是负责人。
 
 跳过第 2 步直接派一个没人审过的方案，等于让一个没有决策权的执行者去替你做技术决定。
 
@@ -85,6 +85,7 @@ ai-room ask --to opencode --question "<场景><这一件具体任务><完成标�
 | Claude Code | `claude-code.md` | 咨询者/决策者。当主聊时：咨询 **codex**，派 **opencode** 执行 |
 | Codex | `codex.md` | 咨询者/决策者。当主聊时：咨询 **claude**，派 **opencode** 执行 |
 | opencode | `opencode.md` | **执行者**。只能用 `ask`，信箱模式加不进去 |
+| dsh | 无独立手册 | **执行者**（需用户明确允许）。只能用 `ask` 被派发，没有信箱身份 |
 
 这三份文件就在本 skill 目录里，和 SKILL.md 同级。**只读你自己那一份。** 三方的可用命令、身份探测方式和 shell 默认超时都不一样，照抄别人的会直接报错。
 
@@ -92,7 +93,7 @@ ai-room ask --to opencode --question "<场景><这一件具体任务><完成标�
 
 ## 三方共同的铁律
 
-1. **角色不串岗。** 决策者（peer）只出判断，保持 `read-only`；执行者（opencode）只干活，不替你定方案。信箱对话模式里的顾问同理：只做技术决策和需求/设计/计划文档审查，只能改 `--writable-doc` 精确列出的文件，**绝不改源码**，**绝不替主聊跑测试、构建、部署或任何真实操作**。只有派给 opencode 执行的那一路才是有手的工人，上面这套约束在那一路上不成立。
+1. **角色不串岗。** 决策者（peer）只出判断，保持 `read-only`；执行者（opencode / dsh）只干活，不替你定方案。**默认执行者是 opencode；dsh 只有在用户明确允许时才能调用。**信箱对话模式里的顾问同理：只做技术决策和需求/设计/计划文档审查，只能改 `--writable-doc` 精确列出的文件，**绝不改源码**，**绝不替主聊跑测试、构建、部署或任何真实操作**。只有派给 opencode / dsh 执行的那一路才是有手的工人，上面这套约束在那一路上不成立。
 2. **路径必须精确。** 所有 `--*-doc` 都要相对工作树根的**精确文件路径**。目录、glob、`..`、只给个扩展名，一律不会扩大权限。
 3. **压缩永远手动。** 任何一方都不得自己执行 `/compact`，只能在拿到 `COMPACT_READY` 之后**提示用户**手动压缩。
 4. **`ask` 的 `changed_files` 回执不是沙箱。** 它是 `git status --porcelain` 的前后差集：看不见 gitignore 里的东西，也救不了跑错项目——子 agent 整个跑在别的仓库时，回执是一片干净。边界只能靠工作目录参数**事先**钉死，事后检测兜不住。
@@ -101,15 +102,16 @@ ai-room ask --to opencode --question "<场景><这一件具体任务><完成标�
 ## `ask` 命令形（默认模式，三方通用）
 
 ```text
-ai-room ask --to claude|codex|opencode --question TEXT
+ai-room ask --to claude|codex|opencode|dsh --question TEXT
             [--related-doc EXACT_PATH]...
             [--permission read-only|workspace-write|full-access]
-            [--model MODEL] [--cwd DIR]
+            [--model MODEL] [--effort LEVEL] [--cwd DIR]
             [--timeout SECONDS] [--max-runtime SECONDS]
             [--permission-mode MODE] [--sandbox MODE] [--no-ledger]
 ```
 
 - `--permission` 默认 `read-only`。`workspace-write` 允许子 agent 在工作目录里改文件、跑命令；`full-access` 解除沙箱。档位由 ask 自己钉死，**不继承本机的厂商配置**——同一个 flag 在不同 config 下含义不同。
+- `--model` / `--effort` 不给时走包内 `resources/models.toml`：决策者（claude / codex）默认最强档 + 思考 `max`，opencode 用它自己的默认。**咨询决策者别传这两个去降档**。换模型改这个 toml，不改代码。`--effort` 取值 low|medium|high|xhigh|max（codex 另有 ultra；opencode 传给 `--variant`），厂商不认的值直接 `E_VALIDATION`。实际跑的模型和档位回在 `data.result.model` / `effort`，也记进台账。
 - `--cwd` 选择针对哪个项目派发。真正传给子 agent 的工作目录是**这个路径所在的 git 工作树根**，不是你给的子目录。不给就用当前进程 cwd。
 - `--timeout` 是**"允许沉默多久"，不是"允许跑多久"**：子 agent 每吐一行（stdout 或 stderr）就把死线往后推，**还在输出的子 agent 不会被掐**。真正封顶的是 `--max-runtime`，不管它多话都到点结束。出厂默认是 300 / 3600 秒，但**本机实际值以 `ai-timeouts show` 为准**。
 - 这两个默认值由环境变量 `AI_ROOM_TIMEOUT` / `AI_ROOM_MAX_RUNTIME` 提供（显式给 flag 仍然优先）。要调就 `ai-timeouts set <分钟>`，一条命令把所有闸一起改到位——**不要手改其中一个**，闸之间的大小关系是有讲究的。
@@ -135,7 +137,7 @@ ai-room ask --to claude|codex|opencode --question TEXT
 | `vendor_resume_command` | 厂商原生续接命令，ai-room 不可用时的兜底 |
 
 ```text
-ai-room resume [--to claude|codex|opencode] [--session SESSION_ID]
+ai-room resume [--to claude|codex|opencode|dsh] [--session SESSION_ID]
                [--question TEXT] [--cwd DIR]
                （其余选项与 ask 完全相同）
 ```
@@ -143,7 +145,7 @@ ai-room resume [--to claude|codex|opencode] [--session SESSION_ID]
 - 不给 `--session` 就续接**本房间里最近一个被掐死的派发**：session id 在子 agent 一开口时就落盘到 `.ai-room/inflight/`，所以哪怕整个 ai-room 进程被你的 shell 掐掉（那种情况连台账都来不及写），把手也还在。
 - 给 `--session` 时**必须同时给 `--to`**：一个 id 不会自报是哪家发的。
 - 不给 `--question` 时默认告诉它"从停下的地方继续，别重头再来"。要补充信息就自己写，但**别把原任务重述一遍**——那等于让它重启。
-- 档位不会自动继承：`--permission` 等选项照原样再给一次。
+- 模型和思考档位**自动沿用该会话上一轮的**（显式给 `--model` / `--effort` 才覆盖）；权限档不会自动继承：`--permission` 等选项照原样再给一次。
 
 先看 `text`：如果超时前已经把话说完了，直接用，连 resume 都不用跑。
 
@@ -156,10 +158,11 @@ ai-room resume [--to claude|codex|opencode] [--session SESSION_ID]
 | claude | `--permission-mode plan` | `acceptEdits` + `--allowedTools Edit,Write`；`full-access` 是 `--dangerously-skip-permissions` | **派发前就预分配**，被掐死也能续 | `claude -r ID` |
 | codex | `-s read-only` + `approval_policy="never"` | `-s workspace-write` + 允许沙箱拒绝升级到沙箱外；`full-access` 是 `danger-full-access` | 它开口后才有 | `codex exec resume ID` |
 | opencode | `--agent plan` | `--auto`；**没有第三档，`full-access` 与 `workspace-write` 完全一样** | 它开口后才有 | `opencode run --session ID` |
+| dsh | `--permission read-only`（映射 read-only preset） | `--permission workspace-write` / `full-access`（映射 workspace-write / danger-full-access preset） | 它开口后才有 | `dsh --profile dsh-agent --session ID` |
 
 日常续接走 `ai-room resume`（它会重新钉住档位并记台账），上面这一列只是兜底。
 
-只有 claude 支持预分配 handle。派给 codex / opencode 的活被外层掐死时，session id 是从它已经吐出来的输出里**边跑边抢救**的，抢不到就没有。另外两条相关的实现事实：codex 的 `exec resume` 不吃 `-s` 也不吃 `-C`，档位改走 `-c sandbox_mode=`，工作目录沿用原会话记录的那个；claude 走 `--output-format stream-json`，因为单对象格式在跑完前一个字都不吐，沉默预算就无从判断。
+只有 claude 支持预分配 handle。派给 codex / opencode / dsh 的活被外层掐死时，session id 是从它已经吐出来的输出里**边跑边抢救**的，抢不到就没有。另外两条相关的实现事实：codex 的 `exec resume` 不吃 `-s` 也不吃 `-C`，档位改走 `-c sandbox_mode=`，工作目录沿用原会话记录的那个；claude 走 `--output-format stream-json`，因为单对象格式在跑完前一个字都不吐，沉默预算就无从判断。
 
 ## 能力 A 的信箱协议（**非默认**，用户点名才走；codex 和 claude 适用，**opencode 跳过本节**）
 

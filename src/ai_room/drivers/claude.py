@@ -17,6 +17,7 @@ from .protocol import (
 
 class ClaudeDriver(Driver):
     name = "claude"
+    efforts = ("low", "medium", "high", "xhigh", "max")
     _BINARY_CANDIDATES = ("claude", "claude.exe")
 
     def invoke(self, request: DriverRequest) -> DriverResult:
@@ -27,6 +28,9 @@ class ClaudeDriver(Driver):
         # budget would degenerate back into a wall clock.  The streamed form
         # emits progress events throughout, and carries the same result object
         # as its final event.  ``--verbose`` is required for it under ``-p``.
+        # Whole-message events still leave a long think silent until it ends,
+        # and at high effort that alone can outlast the silence budget; the
+        # partial chunks keep the stream moving while the model reasons.
         command = [
             binary,
             "-p",
@@ -34,6 +38,7 @@ class ClaudeDriver(Driver):
             "--output-format",
             "stream-json",
             "--verbose",
+            "--include-partial-messages",
         ]
         if request.permission == "full-access":
             command += ["--dangerously-skip-permissions"]
@@ -48,6 +53,8 @@ class ClaudeDriver(Driver):
             command += ["--allowedTools", "Edit,Write"]
         if request.model:
             command += ["--model", request.model]
+        if request.effort:
+            command += ["--effort", request.effort]
         if request.resume_session:
             # -r continues the recorded conversation; --session-id would demand
             # a fresh handle and the two cannot both be given.

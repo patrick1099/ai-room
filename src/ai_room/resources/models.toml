@@ -1,0 +1,17 @@
+# ai-room 派发时的默认模型与思考档位。
+# 只在调用方没给 --model / --effort 时生效；resume 沿用该会话上一轮的设置，不读这里。
+# 新模型出来改这里就行，不用动代码。某个 agent 不写或留空 = 用该 CLI 自己的默认。
+#
+# effort 取值：low | medium | high | xhigh | max（codex 另有 ultra；opencode 传给 --variant）
+
+# 决策者：至少 Opus / GPT Astra 这一档，思考开满。
+[claude]
+model = "opus"          # claude 的别名，始终指向最新 Opus
+effort = "max"
+
+[codex]
+model = "gpt-6-astra"   # codex 没有"最新旗舰"别名，换代时手动改
+effort = "max"
+
+# 执行者：沿用 opencode 自己的默认。
+[opencode]

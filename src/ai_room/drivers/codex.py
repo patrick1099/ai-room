@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import subprocess
 from pathlib import Path
 
 from .process import find_binary, run_cli
 from .protocol import (
     Driver,
+    DriverError,
     DriverRequest,
     DriverResult,
     compose_prompt,
@@ -53,12 +56,15 @@ _TIER_TO_APPROVAL = {
 
 class CodexDriver(Driver):
     name = "codex"
+    efforts = ("low", "medium", "high", "xhigh", "max", "ultra")
     _BINARY_CANDIDATES = ("codex", "codex.exe")
 
     def invoke(self, request: DriverRequest) -> DriverResult:
-        binary = find_binary(self.name, self._BINARY_CANDIDATES)
+        binary = _locate_codex(self.name, self._BINARY_CANDIDATES)
         sandbox_mode = request.sandbox or _TIER_TO_SANDBOX[request.permission]
         overrides = list(_TIER_TO_APPROVAL[request.permission])
+        if request.effort:
+            overrides.append(f'model_reasoning_effort="{request.effort}"')
         if request.resume_session:
             # ``codex exec resume`` accepts neither -s nor -C, so the tier has
             # to travel as a config override and the working directory is
@@ -107,6 +113,62 @@ class CodexDriver(Driver):
             stderr="",
             usage=usage,
         )
+
+
+def _locate_codex(agent: str, candidates: tuple[str, ...]) -> str:
+    """Pick the newest codex among the one on PATH and the desktop app's copies.
+
+    The Codex desktop app updates itself and ships its own codex under
+    ``%LOCALAPPDATA%\\OpenAI\\Codex\\bin\\<hash>\\codex.exe``; the hash changes on
+    every update, so that directory can never be put on PATH for good.  Meanwhile
+    PATH keeps whatever codex was installed by hand, which falls behind.  An old
+    CLI is not merely old: once the app has run, it rewrites the shared models
+    cache in a newer shape and the old CLI refuses to start at all
+    (``failed to load models cache: missing field ...``) or rejects the current
+    model (``requires a newer version``).  Taking the highest version seen makes
+    ai-room follow the app's updates without anyone touching PATH.
+    """
+    found: list[str] = []
+    try:
+        found.append(find_binary(agent, candidates))
+    except DriverError:
+        pass
+    found += [p for p in _desktop_bundled() if p not in found]
+    if not found:
+        return find_binary(agent, candidates)       # raises the usual not-found error
+    if len(found) == 1:
+        return found[0]
+    # max() keeps the first of equal versions, so on a tie PATH's copy wins.
+    return max(found, key=_codex_version)
+
+
+def _desktop_bundled() -> list[str]:
+    """codex.exe copies shipped inside the Codex desktop app, if it is installed."""
+    base = os.environ.get("LOCALAPPDATA")
+    if not base:
+        return []
+    root = Path(base) / "OpenAI" / "Codex" / "bin"
+    if not root.is_dir():
+        return []
+    return [str(p) for p in sorted(root.glob("*/codex.exe")) if p.is_file()]
+
+
+def _codex_version(binary: str) -> tuple[int, ...]:
+    """``codex --version`` as a comparable tuple; anything unreadable sorts last."""
+    try:
+        result = subprocess.run(
+            [binary, "--version"],
+            shell=False,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return (-1,)
+    match = re.search(rb"(\d+)\.(\d+)\.(\d+)", result.stdout)
+    if result.returncode != 0 or not match:
+        return (-1,)
+    return tuple(int(x) for x in match.groups())
 
 
 def _is_git_repo(cwd: Path) -> bool:

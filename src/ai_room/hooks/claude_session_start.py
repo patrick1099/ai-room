@@ -17,9 +17,8 @@ def main(
     environ: Mapping[str, str] | None = None,
 ) -> int:
     """Register one Claude session without modifying project or user settings."""
-    input_stream = stdin or sys.stdin
     environment = os.environ if environ is None else environ
-    payload = json.load(input_stream)
+    payload = _read_payload(stdin)
     if not isinstance(payload, dict):
         raise ValueError("SessionStart input must be one JSON object")
 
@@ -63,6 +62,13 @@ def main(
             },
         )
     return 0
+
+
+def _read_payload(stdin: TextIO | None) -> object:
+    """Read the hook payload as UTF-8 instead of the console code page."""
+    if stdin is not None:
+        return json.load(stdin)
+    return json.loads(sys.stdin.buffer.read().decode("utf-8"))
 
 
 def _required_value(payload: dict[str, object], key: str) -> str:

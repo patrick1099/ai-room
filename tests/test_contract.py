@@ -16,7 +16,15 @@ from ai_room.drivers.registry import driver_for
 
 
 @pytest.mark.contract
-@pytest.mark.parametrize("agent", ["claude", "codex", "opencode"])
+@pytest.mark.parametrize(
+    "agent",
+    [
+        pytest.param("claude", marks=pytest.mark.skip(reason="no quota")),
+        pytest.param("codex", marks=pytest.mark.skip(reason="no quota")),
+        "opencode",
+        "dsh",
+    ],
+)
 def test_contract_driver_returns_session_id(agent: str, tmp_path) -> None:
     request = DriverRequest(
         question="reply with exactly: hi",

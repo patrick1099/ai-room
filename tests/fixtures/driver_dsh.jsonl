@@ -1,0 +1,3 @@
+{"type": "session.started", "session_id": "session-abc", "payload": {"resumed": false, "cwd": "C:\\repo"}}
+{"type": "assistant.delta", "session_id": "session-abc", "payload": {"text": "正在"}}
+{"type": "run.completed", "session_id": "session-abc", "payload": {"text": "最终", "reason": "completed"}}
