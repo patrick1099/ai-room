@@ -168,7 +168,7 @@ def test_shared_skill_routes_to_one_manual_per_vendor() -> None:
             "ai-room wait",
             "timeout_ms",
             "ai-room resume",
-            "压小 `--timeout`",
+            "不要为让 shell 早返回而缩小",
         ),
         # opencode is the executor and has no mailbox identity at all, so its
         # manual must say both rather than describe a role it cannot hold.
