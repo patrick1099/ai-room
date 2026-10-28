@@ -8,12 +8,18 @@ question, and the sub-agent session id so the conversation can be resumed.
 from __future__ import annotations
 
 import json
+import os
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 LEDGER_DIRECTORY = ".ai-room"
 LEDGER_FILENAME = "ledger.md"
+LOCK_FILENAME = "ledger.lock"
+LOCK_TIMEOUT_SECONDS = 60.0
 
 _HEADER = (
     "# ai-room \u6d3e\u53d1\u53f0\u8d26\n\n"
@@ -50,21 +56,59 @@ class LedgerEntry:
 
 
 def append_ledger(root: Path, entry: LedgerEntry) -> Path:
-    """Append ``entry`` to ``<root>/.ai-room/ledger.md`` and return its path."""
+    """Append ``entry`` to ``<root>/.ai-room/ledger.md`` and return its path.
+
+    Dispatches run side by side and can finish at the same moment, so the
+    write happens under an exclusive lock: the header goes in only while the
+    file is still empty, and each entry lands in a single write.
+    """
     path = root / LEDGER_DIRECTORY / LEDGER_FILENAME
     path.parent.mkdir(parents=True, exist_ok=True)
     write_self_gitignore(path.parent)
     block = _format_entry(entry)
-    if path.exists():
+    with _exclusive_lock(path.parent / LOCK_FILENAME):
         with path.open("a", encoding="utf-8") as stream:
-            stream.write("\n")
-            stream.write(block)
-    else:
-        with path.open("w", encoding="utf-8") as stream:
-            stream.write(_HEADER)
-            stream.write("\n")
-            stream.write(block)
+            prefix = "\n" if stream.tell() else _HEADER + "\n"
+            stream.write(prefix + block)
     return path
+
+
+@contextmanager
+def _exclusive_lock(lock_path: Path) -> Iterator[None]:
+    """Hold an exclusive lock on ``lock_path`` that other processes respect.
+
+    The OS releases it when the holder dies, so a dispatch killed mid-write
+    cannot leave the ledger locked.
+    """
+    with lock_path.open("a+b") as handle:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            # LK_LOCK gives up after ten one-second retries, which a handful
+            # of dispatches finishing together already exceeds.
+            deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
+            while True:
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    if time.monotonic() > deadline:
+                        raise
+                    time.sleep(0.02)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def write_self_gitignore(directory: Path) -> None:

@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 from ai_room.ledger import LEDGER_FILENAME, LedgerEntry, append_ledger
+
+SRC = Path(__file__).resolve().parents[1] / "src"
 
 
 def test_append_ledger_creates_file_with_header(tmp_path: Path) -> None:
@@ -165,6 +171,53 @@ def test_append_ledger_appends_without_duplicate_header(tmp_path: Path) -> None:
     assert "sid-1" in content
     assert "sid-2" in content
     assert "`error`" in content
+
+
+_CONCURRENT_WRITER = """
+import sys, time
+from pathlib import Path
+from ai_room.ledger import LedgerEntry, append_ledger
+root, index = Path(sys.argv[1]), sys.argv[2]
+(root / ("ready-" + index)).touch()
+while not (root / "go").exists():
+    time.sleep(0.001)
+append_ledger(root, LedgerEntry(
+    agent="codex", question="q", session_id="sid-" + index, related_docs=(),
+    model=None, exit_code=0, status="ok", timestamp="2026-10-28T15:00:00+08:00",
+))
+"""
+
+
+def test_concurrent_first_appends_keep_every_entry(tmp_path: Path) -> None:
+    """Dispatches that finish together must not overwrite or split entries.
+
+    Several ``ai-room ask`` runs share one ledger, and the first ones to finish
+    race to create it: a writer that truncates the file wipes the entries
+    written just before it.
+    """
+    count = 12
+    env = {**os.environ, "PYTHONPATH": str(SRC)}
+    writers = [
+        subprocess.Popen(
+            [sys.executable, "-c", _CONCURRENT_WRITER, str(tmp_path), str(index)],
+            env=env,
+        )
+        for index in range(count)
+    ]
+    deadline = time.monotonic() + 60
+    while len(list(tmp_path.glob("ready-*"))) < count:
+        assert time.monotonic() < deadline, "writers never started"
+        time.sleep(0.01)
+    (tmp_path / "go").touch()
+    for writer in writers:
+        assert writer.wait(timeout=60) == 0
+
+    content = (tmp_path / ".ai-room" / LEDGER_FILENAME).read_text(encoding="utf-8")
+    headings = [line for line in content.splitlines() if line.startswith("### ")]
+    assert content.count("# ai-room") == 1
+    assert len(headings) == count
+    for index in range(count):
+        assert content.count(f"`sid-{index}`") == 1
 
 
 def test_resume_hint_unknown_session_id(tmp_path: Path) -> None:
